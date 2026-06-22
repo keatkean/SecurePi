@@ -18,8 +18,8 @@ snapshots, and the live view annotates each bag's state.
    output tensors from the frame metadata (`get_outputs` +
    `convert_inference_coords`), exactly like the official Raspberry Pi IMX500
    object-detection demo. No inference runs on the Pi's CPU.
-2. **Track** — each detected bag is matched to an existing track by nearest
-   centroid (within `--stationary-radius` px) or registered as a new bag.
+2. **Track** — each detected bag is matched to an existing track using Intersection 
+   over Union (IoU) or nearest centroid (within `--stationary-radius` px). 
    Tracks unseen for `--timeout` seconds are dropped.
 3. **Attend** — for every tracked bag, SecurePi finds the nearest person. If the
    nearest person is farther than `--proximity` px (or there is no person), the
@@ -72,8 +72,11 @@ python securePi.py --headless
 # Tune detection and alerting
 python securePi.py --unattended-time 60 --proximity 200 --min-confidence 0.6 -v
 
-# Use a different IMX500 network and/or labels file
+# Use a different IMX500 network and/or labels file (see [MODELS.md](MODELS.md) for options)
 python securePi.py --model /usr/share/imx500-models/<network>.rpk --labels labels.txt
+
+# Customize which objects to monitor and who can attend to them (see [LABELS.md](LABELS.md) for all 80 options)
+python securePi.py --bag-labels laptop --person-labels person dog
 ```
 
 > **First run** uploads the network firmware to the sensor — this can take ~30s
@@ -92,6 +95,8 @@ python securePi.py --model /usr/share/imx500-models/<network>.rpk --labels label
 | `--min-confidence` | `0.5` | Minimum detection confidence (0–1) |
 | `--iou` | `0.65` | NMS IoU threshold (nanodet models) |
 | `--max-detections` | `10` | Max detections (nanodet models) |
+| `--bag-labels` | `backpack handbag suitcase` | List of COCO labels to treat as bags |
+| `--person-labels` | `person` | List of COCO labels to treat as people |
 | `--headless` | off | Run without a preview window |
 | `--snapshot-dir` | `./alerts` | Where alert snapshots are written |
 | `--alert-cooldown` | `30` | Seconds between repeat alerts per bag |
@@ -138,14 +143,16 @@ SecurePi/
 ├── securePi.py        # the monitor (detector + tracker + alerting)
 ├── requirements.txt   # dependency notes
 ├── README.md          # this file
+├── LABELS.md          # list of supported tracking objects
+├── MODELS.md          # explanation of available .rpk networks
 └── alerts/            # alert snapshots (created on first alert)
 ```
 
 ## Notes & limitations
 
-- Tracking is a lightweight greedy nearest-centroid matcher — robust for a few
+- Tracking uses Intersection over Union (IoU) and a nearest-centroid fallback — robust for a few
   bags in a fairly static scene, not a full multi-object tracker. Crossing paths
   or heavy occlusion can swap or drop IDs.
 - "Attended" is purely proximity-based; it does not verify *whose* bag it is.
-- The default model uses COCO classes; only `person`, `backpack`, `handbag` and
-  `suitcase` are used.
+- The default model uses COCO classes. By default, only `person`, `backpack`, 
+  `handbag`, and `suitcase` are tracked, but this is fully configurable via CLI.

@@ -26,17 +26,17 @@ import argparse
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+import concurrent.futures
 
 import cv2
 
 try:
     from picamera2 import Picamera2
     from picamera2.devices import IMX500
-    from picamera2.devices.imx500 import (NetworkIntrinsics,
-                                          postprocess_nanodet_detection)
+    from picamera2.devices.imx500 import (NetworkIntrinsics, postprocess_nanodet_detection)
     _IMX500_AVAILABLE = True
 except ImportError:  # let --help / imports work off-device
     Picamera2 = IMX500 = NetworkIntrinsics = postprocess_nanodet_detection = None  # type: ignore[assignment]
@@ -49,8 +49,11 @@ LOGGER = logging.getLogger("securepi")
 DEFAULT_MODEL = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
 
 # COCO categories we treat as "bags". Labels come back as lower-case strings.
-TARGET_BAG_LABELS = {"backpack", "handbag", "suitcase"}
-PERSON_LABELS = {"person"}
+DEFAULT_BAG_LABELS = {"backpack", "handbag", "suitcase"}
+DEFAULT_PERSON_LABELS = {"person"}
+
+# Global executor for non-blocking snapshot saving
+SNAPSHOT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # BGR colours (OpenCV order).
 COLOR_PERSON = (0, 255, 0)
@@ -78,6 +81,8 @@ class Config:
     labels_path: Optional[str] = None    # override the model's built-in labels
     iou: float = 0.65                    # NMS IoU threshold (nanodet models)
     max_detections: int = 10             # max detections (nanodet models)
+    bag_labels: set[str] = field(default_factory=lambda: set(DEFAULT_BAG_LABELS))
+    person_labels: set[str] = field(default_factory=lambda: set(DEFAULT_PERSON_LABELS))
 
 
 @dataclass
@@ -92,14 +97,6 @@ class Detection:
     def centroid(self) -> tuple[float, float]:
         x, y, w, h = self.box
         return (x + w / 2.0, y + h / 2.0)
-
-    @property
-    def is_person(self) -> bool:
-        return self.label in PERSON_LABELS
-
-    @property
-    def is_bag(self) -> bool:
-        return self.label in TARGET_BAG_LABELS
 
 
 @dataclass
@@ -117,6 +114,22 @@ class TrackedBag:
 
 def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def calculate_iou(boxA: tuple[int, int, int, int], boxB: tuple[int, int, int, int]) -> float:
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    if interArea == 0:
+        return 0.0
+
+    boxAArea = boxA[2] * boxA[3]
+    boxBArea = boxB[2] * boxB[3]
+
+    return interArea / float(boxAArea + boxBArea - interArea)
 
 
 class IMX500Detector:
@@ -176,7 +189,7 @@ class IMX500Detector:
             return self._labels[idx].lower()
         return str(idx)
 
-    def detect(self, metadata, picam2) -> list[Detection]:
+    def detect(self, metadata: Any, picam2: Any) -> list[Detection]:
         """Parse the IMX500 output tensors for this frame into Detections."""
         np_outputs = self.imx500.get_outputs(metadata, add_batch=True)
         if np_outputs is None:
@@ -224,7 +237,7 @@ class BagTracker:
         """Match this frame's bag detections to tracks and refresh attention state."""
         matched: set[int] = set()
         for det in bag_detections:
-            bag = self._match(det.centroid, matched)
+            bag = self._match(det.centroid, det.box, matched)
             if bag is None:
                 bag = self._register(det, now)
             else:
@@ -244,14 +257,22 @@ class BagTracker:
             del self.bags[bid]
         return expired
 
-    def _match(self, centroid: tuple[float, float], matched: set[int]) -> Optional[TrackedBag]:
+    def _match(self, centroid: tuple[float, float], box: tuple[int, int, int, int], matched: set[int]) -> Optional[TrackedBag]:
         best: Optional[TrackedBag] = None
+        best_score = -1.0 # higher is better (IoU)
         best_dist = self.config.stationary_radius
         for bag in self.bags.values():
             if bag.bag_id in matched:
                 continue
+            iou = calculate_iou(box, bag.box)
             d = distance(centroid, bag.centroid)
-            if d < best_dist:
+            # Prefer IoU if they overlap significantly
+            if iou > 0.3:
+                if iou > best_score:
+                    best_score = iou
+                    best = bag
+            # Fallback to distance if no good IoU
+            elif best_score == -1.0 and d < best_dist:
                 best_dist = d
                 best = bag
         return best
@@ -279,47 +300,19 @@ class BagTracker:
             bag.alerted = False
 
 
-def draw_box(frame, box: tuple[int, int, int, int], color, label: Optional[str] = None,
-             thickness: int = 2) -> None:
-    x, y, w, h = box
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-    if label:
-        cv2.putText(frame, label, (x, max(y - 10, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-
-def draw_hud(frame, person_count: int, bag_count: int, fps: float) -> None:
-    cv2.rectangle(frame, (10, 10), (330, 72), (0, 0, 0), -1)
-    cv2.putText(frame, f"People: {person_count}  Bags: {bag_count}", (20, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD, 2)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (20, 62),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD, 2)
+def save_snapshot_worker(frame_copy, path: Path) -> None:
+    if cv2.imwrite(str(path), frame_copy):
+        LOGGER.info("Saved alert snapshot: %s", path)
+    else:
+        LOGGER.error("Failed to save alert snapshot: %s", path)
 
 
 def save_snapshot(frame, bag: TrackedBag, config: Config, now: float) -> None:
     config.snapshot_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
     path = config.snapshot_dir / f"alert_bag{bag.bag_id}_{stamp}.jpg"
-    if cv2.imwrite(str(path), frame):
-        LOGGER.info("Saved alert snapshot: %s", path)
-    else:
-        LOGGER.error("Failed to save alert snapshot: %s", path)
-
-
-def handle_bag(frame, bag: TrackedBag, config: Config, now: float) -> None:
-    """Draw a bag in the right state and fire an alert when overdue."""
-    if bag.unattended_start is None:
-        draw_box(frame, bag.box, COLOR_ATTENDED, f"Bag #{bag.bag_id} (Attended)")
-        return
-
-    duration = now - bag.unattended_start
-    if duration >= config.unattended_time_sec:
-        draw_box(frame, bag.box, COLOR_ALERT,
-                 f"ALERT! Bag #{bag.bag_id} unattended {int(duration)}s", thickness=3)
-        _maybe_alert(frame, bag, config, now, duration)
-    else:
-        draw_box(frame, bag.box, COLOR_WARNING,
-                 f"Bag #{bag.bag_id} unattended {int(duration)}s")
+    frame_copy = frame.copy()
+    SNAPSHOT_EXECUTOR.submit(save_snapshot_worker, frame_copy, path)
 
 
 def _maybe_alert(frame, bag: TrackedBag, config: Config, now: float, duration: float) -> None:
@@ -333,6 +326,41 @@ def _maybe_alert(frame, bag: TrackedBag, config: Config, now: float, duration: f
     LOGGER.warning("UNATTENDED BAG ALERT - bag #%d unattended for %ds",
                    bag.bag_id, int(duration))
     save_snapshot(frame, bag, config, now)
+
+
+class Renderer:
+    """Handles UI rendering to decouple it from tracking logic."""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def draw_box(self, frame, box: tuple[int, int, int, int], color, label: Optional[str] = None, thickness: int = 2) -> None:
+        x, y, w, h = box
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+        if label:
+            cv2.putText(frame, label, (x, max(y - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def draw_hud(self, frame, person_count: int, bag_count: int, fps: float) -> None:
+        cv2.rectangle(frame, (10, 10), (330, 72), (0, 0, 0), -1)
+        cv2.putText(frame, f"People: {person_count}  Bags: {bag_count}", (20, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD, 2)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD, 2)
+
+    def handle_bag(self, frame, bag: TrackedBag, now: float) -> None:
+        """Draw a bag in the right state."""
+        if bag.unattended_start is None:
+            self.draw_box(frame, bag.box, COLOR_ATTENDED, f"Bag #{bag.bag_id} (Attended)")
+            return
+
+        duration = now - bag.unattended_start
+        if duration >= self.config.unattended_time_sec:
+            self.draw_box(frame, bag.box, COLOR_ALERT,
+                     f"ALERT! Bag #{bag.bag_id} unattended {int(duration)}s", thickness=3)
+        else:
+            self.draw_box(frame, bag.box, COLOR_WARNING,
+                     f"Bag #{bag.bag_id} unattended {int(duration)}s")
 
 
 def run(config: Config) -> None:
@@ -354,6 +382,7 @@ def run(config: Config) -> None:
     picam2.start()
 
     tracker = BagTracker(config)
+    renderer = Renderer(config)
     LOGGER.info("Security monitor started (%s mode). Press 'q' in the window to quit.",
                 "headless" if config.headless else "preview")
 
@@ -372,17 +401,23 @@ def run(config: Config) -> None:
 
             now = time.time()
             detections = detector.detect(metadata, picam2)
-            persons = [d for d in detections if d.is_person]
-            bags = [d for d in detections if d.is_bag]
+            persons = [d for d in detections if d.label in config.person_labels]
+            bags = [d for d in detections if d.label in config.bag_labels]
             person_centroids = [p.centroid for p in persons]
 
             tracker.update(bags, person_centroids, now)
             tracker.prune(now)
 
             for person in persons:
-                draw_box(frame, person.box, COLOR_PERSON, f"Person {person.score:.2f}")
+                renderer.draw_box(frame, person.box, COLOR_PERSON, f"Person {person.score:.2f}")
             for bag in tracker.bags.values():
-                handle_bag(frame, bag, config, now)
+                renderer.handle_bag(frame, bag, now)
+                
+                # Check alert independently of drawing
+                if bag.unattended_start is not None:
+                    duration = now - bag.unattended_start
+                    if duration >= config.unattended_time_sec:
+                        _maybe_alert(frame, bag, config, now, duration)
 
             t = time.monotonic()
             dt = t - prev
@@ -391,7 +426,7 @@ def run(config: Config) -> None:
                 inst = 1.0 / dt
                 fps = inst if fps == 0.0 else 0.9 * fps + 0.1 * inst
 
-            draw_hud(frame, len(persons), len(tracker.bags), fps)
+            renderer.draw_hud(frame, len(persons), len(tracker.bags), fps)
 
             if not config.headless:
                 cv2.imshow("SecurePi - AI Security Monitor", frame)
@@ -425,6 +460,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="NMS IoU threshold for nanodet models (default: 0.65).")
     p.add_argument("--max-detections", type=int, default=10,
                    help="Max detections for nanodet models (default: 10).")
+    p.add_argument("--bag-labels", nargs="+", default=list(DEFAULT_BAG_LABELS),
+                   help="List of COCO labels to treat as bags.")
+    p.add_argument("--person-labels", nargs="+", default=list(DEFAULT_PERSON_LABELS),
+                   help="List of COCO labels to treat as people.")
     p.add_argument("--headless", action="store_true",
                    help="Run without a preview window; only save alert snapshots.")
     p.add_argument("--snapshot-dir", type=Path, default=Path("alerts"),
@@ -455,6 +494,8 @@ def main(argv=None) -> None:
         labels_path=args.labels,
         iou=args.iou,
         max_detections=args.max_detections,
+        bag_labels=set(args.bag_labels),
+        person_labels=set(args.person_labels),
     )
     run(config)
 
