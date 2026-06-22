@@ -1,0 +1,18 @@
+# SecurePi dependencies — Raspberry Pi AI Camera (IMX500).
+#
+# On Raspberry Pi OS (Bookworm), install the camera + AI stack via apt so the
+# builds match the system libcamera/Qt and the IMX500 firmware/models are
+# present. pip is NOT recommended for picamera2/opencv on the Pi:
+#
+#   sudo apt update
+#   sudo apt install -y python3-picamera2 python3-opencv imx500-all
+#
+#   # imx500-all provides the sensor firmware and the model files under
+#   # /usr/share/imx500-models/ (incl. the default SSD MobileNetV2 network).
+#
+# The entries below are for reference / non-apt environments only.
+# picamera2 installs only on a Raspberry Pi.
+
+opencv-python>=4.5
+numpy>=1.21
+picamera2>=0.3 ; platform_machine == "aarch64" or platform_machine == "armv7l"
