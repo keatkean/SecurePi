@@ -91,7 +91,7 @@ python securePi.py --bag-labels laptop --person-labels person dog
 | `--unattended-time` | `120` | Seconds unattended before an alert |
 | `--proximity` | `150` | Max px between bag and person to count as attended |
 | `--stationary-radius` | `50` | Px a bag may move and stay the same track |
-| `--timeout` | `3` | Seconds before an unseen bag is dropped |
+| `--timeout` | `10` | Coast window: seconds a track survives detection dropouts before being dropped (timer keeps running while coasting) |
 | `--min-confidence` | `0.5` | Minimum detection confidence (0–1) |
 | `--iou` | `0.65` | NMS IoU threshold (nanodet models) |
 | `--max-detections` | `10` | Max detections (nanodet models) |
