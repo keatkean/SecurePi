@@ -90,7 +90,7 @@ python securePi.py --bag-labels laptop --person-labels person dog
 | `--labels` | *(model built-in)* | Override the model's label file |
 | `--unattended-time` | `120` | Seconds unattended before an alert |
 | `--proximity` | `150` | Max px between bag and person to count as attended |
-| `--stationary-radius` | `50` | Px a bag may move and stay the same track |
+| `--stationary-radius` | `120` | Association radius: px a bag may move between detections and still match the same track |
 | `--timeout` | `10` | Coast window: seconds a track survives detection dropouts before being dropped (timer keeps running while coasting) |
 | `--min-confidence` | `0.5` | Minimum detection confidence (0–1) |
 | `--iou` | `0.65` | NMS IoU threshold (nanodet models) |

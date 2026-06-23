@@ -68,11 +68,15 @@ class Config:
     """Tunable parameters for the monitor."""
 
     unattended_time_sec: float = 120.0   # alert after this long unattended
-    stationary_radius: float = 50.0      # px a bag may shift and stay the same track
+    stationary_radius: float = 120.0     # association radius: px a bag may move between
+                                         # detections and still match the same track
     person_proximity_px: float = 150.0   # px within which a bag counts as attended
     track_timeout_sec: float = 10.0      # "coast" window: keep a track alive (and its
                                          # unattended timer running) through detection
                                          # dropouts; only drop it after this long unseen
+    draw_grace_sec: float = 1.5          # stop drawing a coasting track's box once it has
+                                         # been unseen this long (avoids lingering "ghost"
+                                         # boxes); the track itself lives until the timeout
     min_confidence: float = 0.5          # ignore detections below this score
     frame_size: tuple[int, int] = (640, 480)
     headless: bool = False               # run without a preview window
@@ -354,8 +358,14 @@ class Renderer:
 
     def handle_bag(self, frame, bag: TrackedBag, now: float) -> None:
         """Draw a bag in the right state."""
+        unseen = now - bag.last_seen
+        # Don't draw a long-coasting track: avoids a "ghost" box lingering at the
+        # old location after the bag has moved (or genuinely left). The track stays
+        # alive until track_timeout_sec so its unattended timer keeps running.
+        if unseen > self.config.draw_grace_sec:
+            return
         # Mark tracks we're coasting on (no detection matched this frame).
-        suffix = " (searching...)" if (now - bag.last_seen) > 0.5 else ""
+        suffix = " (searching...)" if unseen > 0.5 else ""
 
         if bag.unattended_start is None:
             self.draw_box(frame, bag.box, COLOR_ATTENDED, f"Bag #{bag.bag_id} (Attended){suffix}")
@@ -457,8 +467,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Seconds before an unattended bag triggers an alert (default: 120).")
     p.add_argument("--proximity", type=float, default=150.0,
                    help="Max pixel distance for a bag to count as attended (default: 150).")
-    p.add_argument("--stationary-radius", type=float, default=50.0,
-                   help="Pixel radius for matching a bag to the same track (default: 50).")
+    p.add_argument("--stationary-radius", type=float, default=120.0,
+                   help="Association radius in px: how far a bag may move between "
+                        "detections and still match the same track (default: 120). "
+                        "Raise it if moving a bag spawns a second box; lower it if "
+                        "two nearby bags get merged.")
     p.add_argument("--timeout", type=float, default=10.0,
                    help="Coast window: seconds a bag track survives detection dropouts "
                         "before being dropped (default: 10). Raise it if static bags "
