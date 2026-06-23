@@ -18,12 +18,16 @@ snapshots, and the live view annotates each bag's state.
    output tensors from the frame metadata (`get_outputs` +
    `convert_inference_coords`), exactly like the official Raspberry Pi IMX500
    object-detection demo. No inference runs on the Pi's CPU.
-2. **Track** — each detected bag is matched to an existing track using Intersection 
-   over Union (IoU) or nearest centroid (within `--stationary-radius` px). 
-   Tracks unseen for `--timeout` seconds are dropped.
-3. **Attend** — for every tracked bag, SecurePi finds the nearest person. If the
-   nearest person is farther than `--proximity` px (or there is no person), the
-   bag's *unattended* timer starts; if a person comes close, the timer resets.
+2. **Track** — bags *and* people are each matched to existing tracks using
+   Intersection over Union (IoU) or nearest centroid (bags within
+   `--stationary-radius` px). People get stable ids so a bag can recognise its
+   owner. Tracks unseen for `--timeout` seconds (bags) are dropped.
+3. **Attend (owner-locked)** — when a bag first appears, the person near it
+   (within `--proximity` px) during the first `--owner-claim-time` seconds is
+   adopted as its **owner**. Only that owner being near resets the *unattended*
+   timer. Anyone else — a passer-by, or someone standing nearby on their phone —
+   is ignored, so they can neither reset the timer nor "claim" a bag that arrived
+   with no owner. If the owner leaves, the timer runs.
 4. **Alert** — when a bag stays unattended for `--unattended-time` seconds it
    enters the **ALERT** state: a warning is logged and a JPEG snapshot is written
    to the snapshot directory. Each alert fires once, then repeats at most once
@@ -33,10 +37,10 @@ snapshots, and the live view annotates each bag's state.
 
 | State | Box colour | Meaning |
 |-------|-----------|---------|
-| Attended | cyan | A person is within `--proximity` of the bag |
-| Unattended (counting) | orange | No person nearby; timer running, below threshold |
+| Attended | cyan | The bag's **owner** is within `--proximity` |
+| Unattended (counting) | orange | Owner away (or none); timer running, below threshold |
 | ALERT | red | Unattended ≥ `--unattended-time` seconds |
-| Person | green | A detected person |
+| Person | green | A tracked person (labelled `(owner)` if they own a bag) |
 
 ---
 
@@ -89,7 +93,8 @@ python securePi.py --bag-labels laptop --person-labels person dog
 | `--model` | `…/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk` | IMX500 `.rpk` network |
 | `--labels` | *(model built-in)* | Override the model's label file |
 | `--unattended-time` | `120` | Seconds unattended before an alert |
-| `--proximity` | `150` | Max px between bag and person to count as attended |
+| `--proximity` | `150` | Max px between bag and its owner to count as attended |
+| `--owner-claim-time` | `3` | Seconds after a bag appears during which a nearby person is adopted as its owner |
 | `--stationary-radius` | `120` | Association radius: px a bag may move between detections and still match the same track |
 | `--timeout` | `10` | Coast window: seconds a track survives detection dropouts before being dropped (timer keeps running while coasting) |
 | `--min-confidence` | `0.5` | Minimum detection confidence (0–1) |
@@ -153,6 +158,9 @@ SecurePi/
 - Tracking uses Intersection over Union (IoU) and a nearest-centroid fallback — robust for a few
   bags in a fairly static scene, not a full multi-object tracker. Crossing paths
   or heavy occlusion can swap or drop IDs.
-- "Attended" is purely proximity-based; it does not verify *whose* bag it is.
+- Ownership is matched by position, not by face/appearance re-identification. If
+  the owner walks **out of frame** and returns, they're treated as a new person,
+  so the bag keeps counting as unattended (errs toward alerting — the safe side
+  for security). The owner is recognised across small moves and brief misses.
 - The default model uses COCO classes. By default, only `person`, `backpack`, 
   `handbag`, and `suitcase` are tracked, but this is fully configurable via CLI.

@@ -70,7 +70,12 @@ class Config:
     unattended_time_sec: float = 120.0   # alert after this long unattended
     stationary_radius: float = 120.0     # association radius: px a bag may move between
                                          # detections and still match the same track
-    person_proximity_px: float = 150.0   # px within which a bag counts as attended
+    person_proximity_px: float = 150.0   # px within which the owner attends a bag
+    owner_claim_sec: float = 3.0         # after a bag appears, a person near it within this
+                                         # window is adopted as its OWNER; only the owner
+                                         # attending resets the timer (others are ignored)
+    person_timeout_sec: float = 2.0      # drop a person track unseen for this long
+    person_match_radius: float = 150.0   # px to associate a person to the same track
     track_timeout_sec: float = 10.0      # "coast" window: keep a track alive (and its
                                          # unattended timer running) through detection
                                          # dropouts; only drop it after this long unseen
@@ -113,9 +118,21 @@ class TrackedBag:
     centroid: tuple[float, float]
     box: tuple[int, int, int, int]
     last_seen: float
+    created_at: float                       # when the track was first registered
+    owner_id: Optional[int] = None          # person id adopted as the bag's owner
     unattended_start: Optional[float] = None
     alerted: bool = False
     last_alert_time: float = 0.0
+
+
+@dataclass
+class PersonTrack:
+    """A person followed across frames, giving them a stable id for owner matching."""
+
+    person_id: int
+    centroid: tuple[float, float]
+    box: tuple[int, int, int, int]
+    last_seen: float
 
 
 def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -230,6 +247,57 @@ class IMX500Detector:
         return detections
 
 
+class PersonTracker:
+    """Lightweight IoU/centroid tracker that assigns persons stable ids.
+
+    The ids let BagTracker tell a bag's owner apart from anyone else who happens
+    to walk near it.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.tracks: dict[int, PersonTrack] = {}
+        self._next_id = 0
+
+    def update(self, detections: list[Detection], now: float) -> None:
+        matched: set[int] = set()
+        for det in detections:
+            track = self._match(det.box, det.centroid, matched)
+            if track is None:
+                track = PersonTrack(self._next_id, det.centroid, det.box, now)
+                self.tracks[track.person_id] = track
+                self._next_id += 1
+            else:
+                track.centroid = det.centroid
+                track.box = det.box
+                track.last_seen = now
+            matched.add(track.person_id)
+
+    def prune(self, now: float) -> None:
+        expired = [pid for pid, t in self.tracks.items()
+                   if now - t.last_seen > self.config.person_timeout_sec]
+        for pid in expired:
+            del self.tracks[pid]
+
+    def _match(self, box, centroid, matched: set[int]) -> Optional[PersonTrack]:
+        best: Optional[PersonTrack] = None
+        best_iou = -1.0
+        best_dist = self.config.person_match_radius
+        for track in self.tracks.values():
+            if track.person_id in matched:
+                continue
+            iou = calculate_iou(box, track.box)
+            d = distance(centroid, track.centroid)
+            if iou > 0.2:
+                if iou > best_iou:
+                    best_iou = iou
+                    best = track
+            elif best_iou == -1.0 and d < best_dist:
+                best_dist = d
+                best = track
+        return best
+
+
 class BagTracker:
     """Greedy nearest-centroid tracker with an unattended timer per bag."""
 
@@ -239,7 +307,7 @@ class BagTracker:
         self._next_id = 0
 
     def update(self, bag_detections: list[Detection],
-               person_centroids: list[tuple[float, float]], now: float) -> None:
+               persons: list[PersonTrack], now: float) -> None:
         """Match this frame's bag detections to tracks and refresh attention state."""
         matched: set[int] = set()
         for det in bag_detections:
@@ -251,7 +319,7 @@ class BagTracker:
                 bag.box = det.box
                 bag.last_seen = now
             matched.add(bag.bag_id)
-            self._update_attention(bag, person_centroids, now)
+            self._update_attention(bag, persons, now)
 
     def prune(self, now: float) -> list[int]:
         """Drop tracks not seen within the timeout. Returns removed ids."""
@@ -286,26 +354,43 @@ class BagTracker:
         return best
 
     def _register(self, det: Detection, now: float) -> TrackedBag:
-        bag = TrackedBag(self._next_id, det.centroid, det.box, now)
+        bag = TrackedBag(self._next_id, det.centroid, det.box, now, now)
         self.bags[bag.bag_id] = bag
         self._next_id += 1
         LOGGER.debug("Registered new bag #%d (%s) at %s", bag.bag_id, det.label, det.box)
         return bag
 
     def _update_attention(self, bag: TrackedBag,
-                          person_centroids: list[tuple[float, float]], now: float) -> None:
-        nearest = min(
-            (distance(bag.centroid, p) for p in person_centroids),
-            default=float("inf"),
-        )
-        if nearest > self.config.person_proximity_px:
-            # No one nearby: start the unattended timer if it isn't running.
-            if bag.unattended_start is None:
-                bag.unattended_start = now
-        else:
-            # A person is close: reset the timer and clear any alert latch.
+                          persons: list[PersonTrack], now: float) -> None:
+        """Owner-locked attention: only the bag's owner being near resets the timer.
+
+        The owner is the person adopted while the bag is new (within owner_claim_sec).
+        Once a bag has no owner — e.g. it entered the scene already abandoned — no
+        bystander can claim it, so a passer-by or someone standing nearby never
+        resets the unattended timer.
+        """
+        prox = self.config.person_proximity_px
+
+        # Is the current owner (if any) near the bag right now?
+        owner_present = False
+        if bag.owner_id is not None:
+            owner = next((p for p in persons if p.person_id == bag.owner_id), None)
+            owner_present = owner is not None and distance(bag.centroid, owner.centroid) <= prox
+
+        # While the bag is still new, adopt the nearest in-range person as its owner.
+        if bag.owner_id is None and (now - bag.created_at) <= self.config.owner_claim_sec:
+            nearest = min((p for p in persons if distance(bag.centroid, p.centroid) <= prox),
+                          key=lambda p: distance(bag.centroid, p.centroid), default=None)
+            if nearest is not None:
+                bag.owner_id = nearest.person_id
+                owner_present = True
+                LOGGER.debug("Bag #%d adopted owner = person #%d", bag.bag_id, nearest.person_id)
+
+        if owner_present:
             bag.unattended_start = None
             bag.alerted = False
+        elif bag.unattended_start is None:
+            bag.unattended_start = now
 
 
 def save_snapshot_worker(frame_copy, path: Path) -> None:
@@ -399,6 +484,7 @@ def run(config: Config) -> None:
     picam2.start()
 
     tracker = BagTracker(config)
+    person_tracker = PersonTracker(config)
     renderer = Renderer(config)
     LOGGER.info("Security monitor started (%s mode). Press 'q' in the window to quit.",
                 "headless" if config.headless else "preview")
@@ -418,18 +504,29 @@ def run(config: Config) -> None:
 
             now = time.time()
             detections = detector.detect(metadata, picam2)
-            persons = [d for d in detections if d.label in config.person_labels]
-            bags = [d for d in detections if d.label in config.bag_labels]
-            person_centroids = [p.centroid for p in persons]
+            person_dets = [d for d in detections if d.label in config.person_labels]
+            bag_dets = [d for d in detections if d.label in config.bag_labels]
 
-            tracker.update(bags, person_centroids, now)
+            # Track people first (for stable ids), then bags (which need those ids
+            # to recognise their owner). Pass all live person tracks — including ones
+            # coasting through a brief miss — so the owner isn't lost to a blip.
+            person_tracker.update(person_dets, now)
+            person_tracker.prune(now)
+            persons = list(person_tracker.tracks.values())
+
+            tracker.update(bag_dets, persons, now)
             tracker.prune(now)
 
+            owner_ids = {b.owner_id for b in tracker.bags.values() if b.owner_id is not None}
             for person in persons:
-                renderer.draw_box(frame, person.box, COLOR_PERSON, f"Person {person.score:.2f}")
+                if now - person.last_seen > config.draw_grace_sec:
+                    continue  # don't draw a coasting person's stale box
+                tag = " (owner)" if person.person_id in owner_ids else ""
+                renderer.draw_box(frame, person.box, COLOR_PERSON,
+                                  f"Person #{person.person_id}{tag}")
             for bag in tracker.bags.values():
                 renderer.handle_bag(frame, bag, now)
-                
+
                 # Check alert independently of drawing
                 if bag.unattended_start is not None:
                     duration = now - bag.unattended_start
@@ -443,7 +540,7 @@ def run(config: Config) -> None:
                 inst = 1.0 / dt
                 fps = inst if fps == 0.0 else 0.9 * fps + 0.1 * inst
 
-            renderer.draw_hud(frame, len(persons), len(tracker.bags), fps)
+            renderer.draw_hud(frame, len(person_dets), len(tracker.bags), fps)
 
             if not config.headless:
                 cv2.imshow("SecurePi - AI Security Monitor", frame)
@@ -466,7 +563,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--unattended-time", type=float, default=120.0,
                    help="Seconds before an unattended bag triggers an alert (default: 120).")
     p.add_argument("--proximity", type=float, default=150.0,
-                   help="Max pixel distance for a bag to count as attended (default: 150).")
+                   help="Max pixel distance for the owner to attend a bag (default: 150).")
+    p.add_argument("--owner-claim-time", type=float, default=3.0,
+                   help="Seconds after a bag first appears during which a nearby person is "
+                        "adopted as its owner (default: 3). Only the owner attending resets "
+                        "the unattended timer; passers-by and bystanders are ignored.")
     p.add_argument("--stationary-radius", type=float, default=120.0,
                    help="Association radius in px: how far a bag may move between "
                         "detections and still match the same track (default: 120). "
@@ -507,6 +608,7 @@ def main(argv=None) -> None:
         unattended_time_sec=args.unattended_time,
         stationary_radius=args.stationary_radius,
         person_proximity_px=args.proximity,
+        owner_claim_sec=args.owner_claim_time,
         track_timeout_sec=args.timeout,
         min_confidence=args.min_confidence,
         headless=args.headless,
