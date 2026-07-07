@@ -1,0 +1,29 @@
+# SecurePi shared base settings — applied automatically before any preset.
+# Location presets (lobby.args, kitchen.args, ...) override only what differs;
+# run one of those, not this file:
+#   python securePi.py @lobby.args
+# One flag per line (value on the same line is fine); anything after # is a
+# comment. Later flags win, so a location preset or the command line overrides
+# anything set here.
+
+# --- Alerting ---
+--unattended-time 120       # seconds before an unattended bag alerts
+--alert-cooldown 30         # seconds between repeat alerts per bag
+--snapshot-dir alerts       # where alert JPEGs are saved
+
+# --- Tracking / association ---
+--proximity 150             # px within which the owner attends a bag
+--owner-claim-time 3        # seconds a new bag waits to adopt an owner
+--stationary-radius 120     # px a bag may move and still match its track
+--timeout 10                # seconds a track coasts through dropouts
+--box-smoothing 0.6         # 0..1, lower = steadier boxes; 1.0 = off
+
+# --- Detection ---
+--min-confidence 0.5
+# --model /usr/share/imx500-models/imx500_network_nanodet_plus_416x416_pp.rpk
+# --bag-labels backpack handbag suitcase laptop
+# --person-labels person
+
+# --- Mode ---
+# --headless                # uncomment for SSH / systemd use
+# -v                        # uncomment for debug logging

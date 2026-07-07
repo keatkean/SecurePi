@@ -18,10 +18,15 @@ snapshots, and the live view annotates each bag's state.
    output tensors from the frame metadata (`get_outputs` +
    `convert_inference_coords`), exactly like the official Raspberry Pi IMX500
    object-detection demo. No inference runs on the Pi's CPU.
-2. **Track** — bags *and* people are each matched to existing tracks using
-   Intersection over Union (IoU) or nearest centroid (bags within
-   `--stationary-radius` px). People get stable ids so a bag can recognise its
-   owner. Tracks unseen for `--timeout` seconds (bags) are dropped.
+2. **Track** — bags *and* people are matched to existing tracks by scoring
+   every detection/track pair at once and assigning best-first: Intersection
+   over Union (IoU) overlaps always win, with nearest centroid as the fallback
+   (bags within `--stationary-radius` px). This global matching is independent
+   of detection order, so two nearby objects can't swap tracks. Matched boxes
+   are smoothed across frames (`--box-smoothing`) to damp detector jitter, and
+   snap instantly when an object genuinely moves. People get stable ids so a
+   bag can recognise its owner. Tracks unseen for `--timeout` seconds (bags)
+   are dropped.
 3. **Attend (owner-locked)** — when a bag first appears, the person near it
    (within `--proximity` px) during the first `--owner-claim-time` seconds is
    adopted as its **owner**. Only that owner being near resets the *unattended*
@@ -29,9 +34,10 @@ snapshots, and the live view annotates each bag's state.
    is ignored, so they can neither reset the timer nor "claim" a bag that arrived
    with no owner. If the owner leaves, the timer runs.
 4. **Alert** — when a bag stays unattended for `--unattended-time` seconds it
-   enters the **ALERT** state: a warning is logged and a JPEG snapshot is written
-   to the snapshot directory. Each alert fires once, then repeats at most once
-   per `--alert-cooldown` seconds until a person returns.
+   enters the **ALERT** state: a warning is logged and a fully annotated JPEG
+   snapshot (boxes, labels, HUD) is written to the snapshot directory. Each
+   alert fires once, then repeats at most once per `--alert-cooldown` seconds
+   until a person returns.
 
 ### On-screen states
 
@@ -66,25 +72,68 @@ sudo apt install -y python3-picamera2 python3-opencv imx500-all
 
 ## Usage
 
+Every run takes a `@<preset>.args` settings file (enforced — running without
+one prints the available presets). Extra flags after the preset override it:
+
 ```bash
 # Live preview window (press 'q' to quit)
-python securePi.py
+python securePi.py @lobby.args
 
-# Headless — no window; alert snapshots only (good for SSH / systemd)
-python securePi.py --headless
+# Headless — no window; alert snapshots only (good for SSH / systemd).
+# Skips all frame annotation except when a snapshot is saved, so it's the
+# cheapest way to run.
+python securePi.py @lobby.args --headless
 
-# Tune detection and alerting
-python securePi.py --unattended-time 60 --proximity 200 --min-confidence 0.6 -v
+# Tune detection and alerting for one run without editing the preset
+python securePi.py @lobby.args --unattended-time 60 --proximity 200 --min-confidence 0.6 -v
 
 # Use a different IMX500 network and/or labels file (see [MODELS.md](MODELS.md) for options)
-python securePi.py --model /usr/share/imx500-models/<network>.rpk --labels labels.txt
+python securePi.py @lobby.args --model /usr/share/imx500-models/<network>.rpk --labels labels.txt
 
 # Customize which objects to monitor and who can attend to them (see [LABELS.md](LABELS.md) for all 80 options)
-python securePi.py --bag-labels laptop --person-labels person dog
+python securePi.py @lobby.args --bag-labels laptop --person-labels person dog
 ```
 
 > **First run** uploads the network firmware to the sensor — this can take ~30s
 > and shows a progress bar before the camera starts.
+
+### Settings files — no flags to remember
+
+All settings live in preset files; the script refuses to start without one, so
+a camera can never accidentally run with unintended defaults. Pass a preset
+with `@`:
+
+```bash
+python securePi.py @lobby.args      # busy lobby camera
+python securePi.py @kitchen.args    # staff kitchen camera
+```
+
+Presets live in the [presets/](presets/) folder and are layered:
+
+- [presets/common.args](presets/common.args) — the shared base: every setting,
+  commented. It is **applied automatically** before whichever preset you name.
+- [presets/lobby.args](presets/lobby.args),
+  [presets/kitchen.args](presets/kitchen.args) — per-location files containing
+  only the overrides for that spot. Copy one to add a new location:
+
+```text
+# SecurePi — LOBBY preset:  python securePi.py @lobby.args
+--unattended-time 60
+--proximity 120
+--snapshot-dir alerts/lobby
+```
+
+You don't need to type the folder: `@lobby.args` is looked up in `presets/`
+automatically (an explicit path like `@presets/lobby.args` or an absolute path
+also works, from any directory).
+
+The file format: one flag per line (the value goes on the same line), blank
+lines are skipped, and anything after `#` is a comment. Later flags win, so a
+location preset overrides `common.args`, and the command line overrides both:
+
+```bash
+python securePi.py @lobby.args --headless --unattended-time 30
+```
 
 ### Options
 
@@ -98,6 +147,7 @@ python securePi.py --bag-labels laptop --person-labels person dog
 | `--stationary-radius` | `120` | Association radius: px a bag may move between detections and still match the same track |
 | `--timeout` | `10` | Coast window: seconds a track survives detection dropouts before being dropped (timer keeps running while coasting) |
 | `--min-confidence` | `0.5` | Minimum detection confidence (0–1) |
+| `--box-smoothing` | `0.6` | Weight of the newest detection when smoothing drawn boxes (0–1). Lower = steadier boxes on static objects; `1.0` disables smoothing |
 | `--iou` | `0.65` | NMS IoU threshold (nanodet models) |
 | `--max-detections` | `10` | Max detections (nanodet models) |
 | `--bag-labels` | `backpack handbag suitcase` | List of COCO labels to treat as bags |
@@ -126,7 +176,7 @@ After=multi-user.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/SecurePi
-ExecStart=/usr/bin/python3 /home/pi/SecurePi/securePi.py --headless --snapshot-dir /home/pi/SecurePi/alerts
+ExecStart=/usr/bin/python3 /home/pi/SecurePi/securePi.py @lobby.args --headless
 Restart=on-failure
 
 [Install]
@@ -146,6 +196,11 @@ journalctl -u securepi.service -f      # follow logs / alerts
 ```
 SecurePi/
 ├── securePi.py        # the monitor (detector + tracker + alerting)
+├── presets/           # settings files — run with `python securePi.py @<name>.args`
+│   ├── common.args    # shared base (every flag, commented) — applied automatically
+│   ├── lobby.args     # location preset: overrides for the lobby camera
+│   ├── kitchen.args   # location preset: overrides for the kitchen camera
+│   └── carpark.args   # location preset: overrides for the carpark camera
 ├── requirements.txt   # dependency notes
 ├── README.md          # this file
 ├── LABELS.md          # list of supported tracking objects
@@ -155,9 +210,11 @@ SecurePi/
 
 ## Notes & limitations
 
-- Tracking uses Intersection over Union (IoU) and a nearest-centroid fallback — robust for a few
-  bags in a fairly static scene, not a full multi-object tracker. Crossing paths
-  or heavy occlusion can swap or drop IDs.
+- Tracking uses best-first global matching on Intersection over Union (IoU)
+  with a nearest-centroid fallback — robust for a few bags in a fairly static
+  scene, not a full multi-object tracker (no motion prediction or appearance
+  re-identification). Heavy occlusion or objects crossing while undetected can
+  still swap or drop IDs.
 - Ownership is matched by position, not by face/appearance re-identification. If
   the owner walks **out of frame** and returns, they're treated as a new person,
   so the bag keeps counting as unattended (errs toward alerting — the safe side

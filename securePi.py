@@ -13,11 +13,15 @@ Picamera2 frame metadata via the IMX500 helper (`get_outputs` +
 detection demo. Runs with a live preview window by default, or fully headless
 (`--headless`) for SSH / systemd use. Alert snapshots are saved to disk.
 
+Settings come from preset files in the presets/ folder (required):
+presets/common.args is applied automatically as the shared base, then the
+named preset's overrides, then any command-line flags.
+
 Examples
 --------
-    python securePi.py
-    python securePi.py --headless --unattended-time 60
-    python securePi.py --model /usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk
+    python securePi.py @lobby.args
+    python securePi.py @kitchen.args --headless --unattended-time 60
+    python securePi.py @lobby.args --model /usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +88,9 @@ class Config:
                                          # been unseen this long (avoids lingering "ghost"
                                          # boxes); the track itself lives until the timeout
     min_confidence: float = 0.5          # ignore detections below this score
+    box_smoothing: float = 0.6           # weight of the newest detection when smoothing a
+                                         # track's drawn box (1.0 = no smoothing); damps
+                                         # frame-to-frame detector jitter on static objects
     frame_size: tuple[int, int] = (640, 480)
     headless: bool = False               # run without a preview window
     alert_cooldown_sec: float = 30.0     # seconds between repeat alerts per bag
@@ -106,8 +114,7 @@ class Detection:
 
     @property
     def centroid(self) -> tuple[float, float]:
-        x, y, w, h = self.box
-        return (x + w / 2.0, y + h / 2.0)
+        return box_centroid(self.box)
 
 
 @dataclass
@@ -139,6 +146,11 @@ def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def box_centroid(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    x, y, w, h = box
+    return (x + w / 2.0, y + h / 2.0)
+
+
 def calculate_iou(boxA: tuple[int, int, int, int], boxB: tuple[int, int, int, int]) -> float:
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
@@ -153,6 +165,54 @@ def calculate_iou(boxA: tuple[int, int, int, int], boxB: tuple[int, int, int, in
     boxBArea = boxB[2] * boxB[3]
 
     return interArea / float(boxAArea + boxBArea - interArea)
+
+
+def smooth_box(old: tuple[int, int, int, int], new: tuple[int, int, int, int],
+               alpha: float) -> tuple[int, int, int, int]:
+    """Blend consecutive boxes to damp detector jitter on the drawn box.
+
+    ``alpha`` is the weight of the NEW detection (1.0 disables smoothing). If
+    the new box barely overlaps the old one the object genuinely moved, so snap
+    to the detection instead of dragging a laggy box across the scene.
+    """
+    if alpha >= 1.0 or calculate_iou(old, new) < 0.2:
+        return new
+    x, y, w, h = (round(o + alpha * (n - o)) for o, n in zip(old, new))
+    return (x, y, w, h)
+
+
+def match_detections(detections: list[Detection], tracks: list,
+                     iou_gate: float, dist_gate: float) -> dict[int, Any]:
+    """Best-first global matching of this frame's detections to tracks.
+
+    Considers every detection/track pair at once: IoU overlaps (>= iou_gate)
+    always outrank centroid-distance fallbacks (<= dist_gate), and within each
+    tier the strongest pair is assigned first. Unlike per-detection greedy
+    matching this is independent of detection order, so one detection can't
+    steal the track that another detection overlaps better.
+
+    Returns {detection_index: track}.
+    """
+    pairs: list[tuple[int, float, int, int]] = []
+    for di, det in enumerate(detections):
+        for ti, track in enumerate(tracks):
+            iou = calculate_iou(det.box, track.box)
+            if iou >= iou_gate:
+                pairs.append((1, iou, di, ti))
+            else:
+                d = distance(det.centroid, track.centroid)
+                if d <= dist_gate:
+                    pairs.append((0, -d, di, ti))
+    pairs.sort(key=lambda p: (p[0], p[1]), reverse=True)
+
+    matches: dict[int, Any] = {}
+    used_tracks: set[int] = set()
+    for _, _, di, ti in pairs:
+        if di in matches or ti in used_tracks:
+            continue
+        matches[di] = tracks[ti]
+        used_tracks.add(ti)
+    return matches
 
 
 class IMX500Detector:
@@ -243,7 +303,9 @@ class IMX500Detector:
             # in the main-stream image space, accounting for the ScalerCrop.
             x, y, w, h = self.imx500.convert_inference_coords(box, metadata, picam2)
             label = self._label_for(int(category))
-            detections.append(Detection(label, float(score), (int(x), int(y), int(w), int(h))))
+            # round() rather than int(): truncation shifts every box up-left.
+            detections.append(Detection(label, float(score),
+                                        (round(x), round(y), round(w), round(h))))
         return detections
 
 
@@ -260,42 +322,25 @@ class PersonTracker:
         self._next_id = 0
 
     def update(self, detections: list[Detection], now: float) -> None:
-        matched: set[int] = set()
-        for det in detections:
-            track = self._match(det.box, det.centroid, matched)
+        matches = match_detections(detections, list(self.tracks.values()),
+                                   iou_gate=0.2,
+                                   dist_gate=self.config.person_match_radius)
+        for di, det in enumerate(detections):
+            track = matches.get(di)
             if track is None:
                 track = PersonTrack(self._next_id, det.centroid, det.box, now)
                 self.tracks[track.person_id] = track
                 self._next_id += 1
             else:
-                track.centroid = det.centroid
-                track.box = det.box
+                track.box = smooth_box(track.box, det.box, self.config.box_smoothing)
+                track.centroid = box_centroid(track.box)
                 track.last_seen = now
-            matched.add(track.person_id)
 
     def prune(self, now: float) -> None:
         expired = [pid for pid, t in self.tracks.items()
                    if now - t.last_seen > self.config.person_timeout_sec]
         for pid in expired:
             del self.tracks[pid]
-
-    def _match(self, box, centroid, matched: set[int]) -> Optional[PersonTrack]:
-        best: Optional[PersonTrack] = None
-        best_iou = -1.0
-        best_dist = self.config.person_match_radius
-        for track in self.tracks.values():
-            if track.person_id in matched:
-                continue
-            iou = calculate_iou(box, track.box)
-            d = distance(centroid, track.centroid)
-            if iou > 0.2:
-                if iou > best_iou:
-                    best_iou = iou
-                    best = track
-            elif best_iou == -1.0 and d < best_dist:
-                best_dist = d
-                best = track
-        return best
 
 
 class BagTracker:
@@ -309,16 +354,17 @@ class BagTracker:
     def update(self, bag_detections: list[Detection],
                persons: list[PersonTrack], now: float) -> None:
         """Match this frame's bag detections to tracks and refresh attention state."""
-        matched: set[int] = set()
-        for det in bag_detections:
-            bag = self._match(det.centroid, det.box, matched)
+        matches = match_detections(bag_detections, list(self.bags.values()),
+                                   iou_gate=0.3,
+                                   dist_gate=self.config.stationary_radius)
+        for di, det in enumerate(bag_detections):
+            bag = matches.get(di)
             if bag is None:
                 bag = self._register(det, now)
             else:
-                bag.centroid = det.centroid
-                bag.box = det.box
+                bag.box = smooth_box(bag.box, det.box, self.config.box_smoothing)
+                bag.centroid = box_centroid(bag.box)
                 bag.last_seen = now
-            matched.add(bag.bag_id)
             self._update_attention(bag, persons, now)
 
     def prune(self, now: float) -> list[int]:
@@ -332,26 +378,6 @@ class BagTracker:
                          bid, now - self.bags[bid].last_seen, self.config.track_timeout_sec)
             del self.bags[bid]
         return expired
-
-    def _match(self, centroid: tuple[float, float], box: tuple[int, int, int, int], matched: set[int]) -> Optional[TrackedBag]:
-        best: Optional[TrackedBag] = None
-        best_score = -1.0 # higher is better (IoU)
-        best_dist = self.config.stationary_radius
-        for bag in self.bags.values():
-            if bag.bag_id in matched:
-                continue
-            iou = calculate_iou(box, bag.box)
-            d = distance(centroid, bag.centroid)
-            # Prefer IoU if they overlap significantly
-            if iou > 0.3:
-                if iou > best_score:
-                    best_score = iou
-                    best = bag
-            # Fallback to distance if no good IoU
-            elif best_score == -1.0 and d < best_dist:
-                best_dist = d
-                best = bag
-        return best
 
     def _register(self, det: Detection, now: float) -> TrackedBag:
         bag = TrackedBag(self._next_id, det.centroid, det.box, now, now)
@@ -379,8 +405,9 @@ class BagTracker:
 
         # While the bag is still new, adopt the nearest in-range person as its owner.
         if bag.owner_id is None and (now - bag.created_at) <= self.config.owner_claim_sec:
-            nearest = min((p for p in persons if distance(bag.centroid, p.centroid) <= prox),
-                          key=lambda p: distance(bag.centroid, p.centroid), default=None)
+            in_range = [(distance(bag.centroid, p.centroid), p) for p in persons]
+            nearest = min((pair for pair in in_range if pair[0] <= prox),
+                          key=lambda pair: pair[0], default=(None, None))[1]
             if nearest is not None:
                 bag.owner_id = nearest.person_id
                 owner_present = True
@@ -408,16 +435,20 @@ def save_snapshot(frame, bag: TrackedBag, config: Config, now: float) -> None:
     SNAPSHOT_EXECUTOR.submit(save_snapshot_worker, frame_copy, path)
 
 
-def _maybe_alert(frame, bag: TrackedBag, config: Config, now: float, duration: float) -> None:
-    """Log + snapshot on the first alert, then at most once per cooldown."""
-    first = not bag.alerted
-    repeat_due = now - bag.last_alert_time >= config.alert_cooldown_sec
-    if not (first or repeat_due):
-        return
+def _alert_due(bag: TrackedBag, config: Config, now: float) -> bool:
+    """True if this bag should log + snapshot this frame (first alert or cooldown up)."""
+    if bag.unattended_start is None:
+        return False
+    if now - bag.unattended_start < config.unattended_time_sec:
+        return False
+    return not bag.alerted or now - bag.last_alert_time >= config.alert_cooldown_sec
+
+
+def _fire_alert(frame, bag: TrackedBag, config: Config, now: float) -> None:
     bag.alerted = True
     bag.last_alert_time = now
     LOGGER.warning("UNATTENDED BAG ALERT - bag #%d unattended for %ds",
-                   bag.bag_id, int(duration))
+                   bag.bag_id, int(now - bag.unattended_start))
     save_snapshot(frame, bag, config, now)
 
 
@@ -517,21 +548,7 @@ def run(config: Config) -> None:
             tracker.update(bag_dets, persons, now)
             tracker.prune(now)
 
-            owner_ids = {b.owner_id for b in tracker.bags.values() if b.owner_id is not None}
-            for person in persons:
-                if now - person.last_seen > config.draw_grace_sec:
-                    continue  # don't draw a coasting person's stale box
-                tag = " (owner)" if person.person_id in owner_ids else ""
-                renderer.draw_box(frame, person.box, COLOR_PERSON,
-                                  f"Person #{person.person_id}{tag}")
-            for bag in tracker.bags.values():
-                renderer.handle_bag(frame, bag, now)
-
-                # Check alert independently of drawing
-                if bag.unattended_start is not None:
-                    duration = now - bag.unattended_start
-                    if duration >= config.unattended_time_sec:
-                        _maybe_alert(frame, bag, config, now, duration)
+            alerts_due = [b for b in tracker.bags.values() if _alert_due(b, config, now)]
 
             t = time.monotonic()
             dt = t - prev
@@ -540,7 +557,26 @@ def run(config: Config) -> None:
                 inst = 1.0 / dt
                 fps = inst if fps == 0.0 else 0.9 * fps + 0.1 * inst
 
-            renderer.draw_hud(frame, len(person_dets), len(tracker.bags), fps)
+            # Headless frames are never shown, so skip all drawing unless an
+            # alert snapshot is about to be saved. Drawing happens BEFORE the
+            # alerts fire so snapshots carry the full annotations.
+            if not config.headless or alerts_due:
+                owner_ids = {b.owner_id for b in tracker.bags.values()
+                             if b.owner_id is not None}
+                visible_persons = 0
+                for person in persons:
+                    if now - person.last_seen > config.draw_grace_sec:
+                        continue  # don't draw a coasting person's stale box
+                    visible_persons += 1
+                    tag = " (owner)" if person.person_id in owner_ids else ""
+                    renderer.draw_box(frame, person.box, COLOR_PERSON,
+                                      f"Person #{person.person_id}{tag}")
+                for bag in tracker.bags.values():
+                    renderer.handle_bag(frame, bag, now)
+                renderer.draw_hud(frame, visible_persons, len(tracker.bags), fps)
+
+            for bag in alerts_due:
+                _fire_alert(frame, bag, config, now)
 
             if not config.headless:
                 cv2.imshow("SecurePi - AI Security Monitor", frame)
@@ -554,8 +590,61 @@ def run(config: Config) -> None:
         LOGGER.info("Security monitor stopped.")
 
 
+class _ArgFileParser(argparse.ArgumentParser):
+    """ArgumentParser that also reads flags from a file: `securePi.py @site.args`.
+
+    Inside the file, blank lines are skipped, everything after a `#` is a
+    comment, and a flag and its value may share a line (`--unattended-time 60`).
+    """
+
+    def convert_arg_line_to_args(self, arg_line: str) -> list[str]:
+        line = arg_line.split("#", 1)[0].strip()
+        return line.split()
+
+
+# Location presets live here; common.args in the same folder is the shared
+# base applied automatically before whichever preset the user names.
+PRESETS_DIR = Path(__file__).resolve().parent / "presets"
+
+
+def _require_args_file(parser: argparse.ArgumentParser, raw_args: list[str]) -> None:
+    """Refuse to run without an @<preset>.args file, listing the ones available."""
+    if any(str(a).startswith("@") for a in raw_args):
+        return
+    presets = sorted(f.name for f in PRESETS_DIR.glob("*.args")
+                     if f.name != "common.args")
+    if presets:
+        hint = "available presets: " + ", ".join(f"@{name}" for name in presets)
+    else:
+        hint = f"create one in {PRESETS_DIR} (see README)"
+    parser.error(f"a settings file is required, e.g. `python securePi.py @lobby.args` — {hint}")
+
+
+def _resolve_preset_refs(raw_args: list[str]) -> list[str]:
+    """Let `@lobby.args` find presets/lobby.args regardless of working directory.
+
+    An @path that exists as given (relative to the CWD, or absolute) is kept;
+    otherwise it is looked up by name in PRESETS_DIR.
+    """
+    resolved = []
+    for arg in raw_args:
+        if isinstance(arg, str) and arg.startswith("@") and not Path(arg[1:]).exists():
+            candidate = PRESETS_DIR / Path(arg[1:]).name
+            if candidate.exists():
+                arg = f"@{candidate}"
+        resolved.append(arg)
+    return resolved
+
+
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SecurePi — IMX500 unattended-bag security monitor.")
+    p = _ArgFileParser(
+        description="SecurePi — IMX500 unattended-bag security monitor.",
+        fromfile_prefix_chars="@",
+        epilog="A @<preset>.args settings file is required, e.g. `python securePi.py "
+               "@lobby.args`. Presets live in the presets/ folder next to this script; "
+               "presets/common.args is applied automatically as the base. Flags given "
+               "after the preset override it.",
+    )
     p.add_argument("--model", default=DEFAULT_MODEL,
                    help="Path to the IMX500 .rpk network (default: COCO SSD MobileNetV2).")
     p.add_argument("--labels", default=None,
@@ -579,6 +668,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "vanish; the unattended timer keeps running while coasting.")
     p.add_argument("--min-confidence", type=float, default=0.5,
                    help="Minimum detection confidence 0..1 (default: 0.5).")
+    p.add_argument("--box-smoothing", type=float, default=0.6,
+                   help="Weight of the newest detection when smoothing drawn boxes, "
+                        "0..1 (default: 0.6). Lower = steadier boxes on static objects; "
+                        "1.0 disables smoothing.")
     p.add_argument("--iou", type=float, default=0.65,
                    help="NMS IoU threshold for nanodet models (default: 0.65).")
     p.add_argument("--max-detections", type=int, default=10,
@@ -594,7 +687,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--alert-cooldown", type=float, default=30.0,
                    help="Seconds between repeat alerts for the same bag (default: 30).")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
-    return p.parse_args(argv)
+    raw = sys.argv[1:] if argv is None else list(argv)
+    expanded = _resolve_preset_refs(raw)
+    base = PRESETS_DIR / "common.args"
+    if base.exists():
+        # Shared base first, so the user's preset and CLI flags override it.
+        expanded = [f"@{base}"] + expanded
+    args = p.parse_args(expanded)   # parse first so -h/--help still works
+    _require_args_file(p, raw)
+    return args
 
 
 def main(argv=None) -> None:
@@ -611,6 +712,7 @@ def main(argv=None) -> None:
         owner_claim_sec=args.owner_claim_time,
         track_timeout_sec=args.timeout,
         min_confidence=args.min_confidence,
+        box_smoothing=args.box_smoothing,
         headless=args.headless,
         alert_cooldown_sec=args.alert_cooldown,
         snapshot_dir=args.snapshot_dir,
