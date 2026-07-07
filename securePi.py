@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -95,6 +96,8 @@ class Config:
     headless: bool = False               # run without a preview window
     alert_cooldown_sec: float = 30.0     # seconds between repeat alerts per bag
     snapshot_dir: Path = Path("alerts")  # where alert snapshots are written
+    max_snapshots: int = 500             # keep at most this many snapshots; oldest are
+                                         # deleted so long runs can't fill the SD card
     # IMX500 detector settings
     model_path: str = DEFAULT_MODEL
     labels_path: Optional[str] = None    # override the model's built-in labels
@@ -420,19 +423,29 @@ class BagTracker:
             bag.unattended_start = now
 
 
-def save_snapshot_worker(frame_copy, path: Path) -> None:
+def save_snapshot_worker(frame_copy, path: Path, directory: Path, keep: int) -> None:
     if cv2.imwrite(str(path), frame_copy):
         LOGGER.info("Saved alert snapshot: %s", path)
     else:
         LOGGER.error("Failed to save alert snapshot: %s", path)
+    try:
+        # Cap the directory so an unattended deployment can't fill the SD card
+        # (a full card takes the whole Pi down, not just the snapshots).
+        snaps = sorted(directory.glob("alert_*.jpg"), key=lambda f: f.stat().st_mtime)
+        for old in snaps[:max(0, len(snaps) - keep)]:
+            old.unlink()
+            LOGGER.debug("Pruned old snapshot: %s", old)
+    except OSError as exc:
+        LOGGER.warning("Snapshot pruning failed: %s", exc)
 
 
-def save_snapshot(frame, bag: TrackedBag, config: Config, now: float) -> None:
+def save_snapshot(frame, bag: TrackedBag, config: Config) -> None:
     config.snapshot_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    # Wall clock for the filename only — tracking runs on the monotonic clock.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     path = config.snapshot_dir / f"alert_bag{bag.bag_id}_{stamp}.jpg"
-    frame_copy = frame.copy()
-    SNAPSHOT_EXECUTOR.submit(save_snapshot_worker, frame_copy, path)
+    SNAPSHOT_EXECUTOR.submit(save_snapshot_worker, frame.copy(), path,
+                             config.snapshot_dir, config.max_snapshots)
 
 
 def _alert_due(bag: TrackedBag, config: Config, now: float) -> bool:
@@ -449,7 +462,7 @@ def _fire_alert(frame, bag: TrackedBag, config: Config, now: float) -> None:
     bag.last_alert_time = now
     LOGGER.warning("UNATTENDED BAG ALERT - bag #%d unattended for %ds",
                    bag.bag_id, int(now - bag.unattended_start))
-    save_snapshot(frame, bag, config, now)
+    save_snapshot(frame, bag, config)
 
 
 class Renderer:
@@ -496,6 +509,11 @@ class Renderer:
                      f"Bag #{bag.bag_id} unattended {int(duration)}s{suffix}")
 
 
+def _sigterm_exit(signum, frame) -> None:
+    """Route SIGTERM (systemctl stop) through the normal cleanup path."""
+    raise SystemExit(0)
+
+
 def run(config: Config) -> None:
     detector = IMX500Detector(config)
 
@@ -505,14 +523,19 @@ def run(config: Config) -> None:
         controls["FrameRate"] = detector.inference_rate
     # RGB888 yields a 3-channel array in BGR order — exactly what OpenCV expects,
     # so the preview and saved snapshots have correct colours.
+    # buffer_count: enough to ride out processing hiccups without queueing
+    # stale frames (each buffer is a full frame of CMA memory, and a deep
+    # queue means alerting on the past if the loop ever falls behind).
     cam_config = picam2.create_preview_configuration(
         main={"size": config.frame_size, "format": "RGB888"},
         controls=controls,
-        buffer_count=12,
+        buffer_count=6,
     )
     picam2.configure(cam_config)
     detector.show_progress()  # firmware upload progress bar on first run
     picam2.start()
+
+    signal.signal(signal.SIGTERM, _sigterm_exit)  # systemd stop → clean shutdown
 
     tracker = BagTracker(config)
     person_tracker = PersonTracker(config)
@@ -525,42 +548,49 @@ def run(config: Config) -> None:
 
     try:
         while True:
-            # capture_request() keeps the frame and its detection metadata in sync.
+            # capture_request() keeps the frame and its detection metadata in
+            # sync. The request is held while tracking runs so the pixel copy
+            # (~1 MB per frame) can be skipped entirely on headless frames
+            # where no alert snapshot is due.
             request = picam2.capture_request()
             try:
-                frame = request.make_array("main")
                 metadata = request.get_metadata()
+
+                # Monotonic clock for all track/alert timing: the Pi has no
+                # RTC, so time.time() can jump hours when NTP syncs — which
+                # would instantly "expire" every unattended timer.
+                now = time.monotonic()
+                detections = detector.detect(metadata, picam2)
+                person_dets = [d for d in detections if d.label in config.person_labels]
+                bag_dets = [d for d in detections if d.label in config.bag_labels]
+
+                # Track people first (for stable ids), then bags (which need those ids
+                # to recognise their owner). Pass all live person tracks — including ones
+                # coasting through a brief miss — so the owner isn't lost to a blip.
+                person_tracker.update(person_dets, now)
+                person_tracker.prune(now)
+                persons = list(person_tracker.tracks.values())
+
+                tracker.update(bag_dets, persons, now)
+                tracker.prune(now)
+
+                alerts_due = [b for b in tracker.bags.values()
+                              if _alert_due(b, config, now)]
+                frame = (request.make_array("main")
+                         if not config.headless or alerts_due else None)
             finally:
                 request.release()
 
-            now = time.time()
-            detections = detector.detect(metadata, picam2)
-            person_dets = [d for d in detections if d.label in config.person_labels]
-            bag_dets = [d for d in detections if d.label in config.bag_labels]
-
-            # Track people first (for stable ids), then bags (which need those ids
-            # to recognise their owner). Pass all live person tracks — including ones
-            # coasting through a brief miss — so the owner isn't lost to a blip.
-            person_tracker.update(person_dets, now)
-            person_tracker.prune(now)
-            persons = list(person_tracker.tracks.values())
-
-            tracker.update(bag_dets, persons, now)
-            tracker.prune(now)
-
-            alerts_due = [b for b in tracker.bags.values() if _alert_due(b, config, now)]
-
-            t = time.monotonic()
-            dt = t - prev
-            prev = t
+            dt = now - prev
+            prev = now
             if dt > 0:
                 inst = 1.0 / dt
                 fps = inst if fps == 0.0 else 0.9 * fps + 0.1 * inst
 
-            # Headless frames are never shown, so skip all drawing unless an
-            # alert snapshot is about to be saved. Drawing happens BEFORE the
-            # alerts fire so snapshots carry the full annotations.
-            if not config.headless or alerts_due:
+            # Drawing happens BEFORE the alerts fire so snapshots carry the
+            # full annotations. frame is None only on headless frames with no
+            # alert due, which need no drawing at all.
+            if frame is not None:
                 owner_ids = {b.owner_id for b in tracker.bags.values()
                              if b.owner_id is not None}
                 visible_persons = 0
@@ -645,47 +675,55 @@ def parse_args(argv=None) -> argparse.Namespace:
                "presets/common.args is applied automatically as the base. Flags given "
                "after the preset override it.",
     )
-    p.add_argument("--model", default=DEFAULT_MODEL,
+    d = Config()  # single source of truth for defaults
+    p.add_argument("--model", default=d.model_path,
                    help="Path to the IMX500 .rpk network (default: COCO SSD MobileNetV2).")
-    p.add_argument("--labels", default=None,
+    p.add_argument("--labels", default=d.labels_path,
                    help="Optional path to a labels file overriding the model's built-in labels.")
-    p.add_argument("--unattended-time", type=float, default=120.0,
-                   help="Seconds before an unattended bag triggers an alert (default: 120).")
-    p.add_argument("--proximity", type=float, default=150.0,
-                   help="Max pixel distance for the owner to attend a bag (default: 150).")
-    p.add_argument("--owner-claim-time", type=float, default=3.0,
+    p.add_argument("--unattended-time", type=float, default=d.unattended_time_sec,
+                   help="Seconds before an unattended bag triggers an alert "
+                        "(default: %(default)s).")
+    p.add_argument("--proximity", type=float, default=d.person_proximity_px,
+                   help="Max pixel distance for the owner to attend a bag "
+                        "(default: %(default)s).")
+    p.add_argument("--owner-claim-time", type=float, default=d.owner_claim_sec,
                    help="Seconds after a bag first appears during which a nearby person is "
-                        "adopted as its owner (default: 3). Only the owner attending resets "
-                        "the unattended timer; passers-by and bystanders are ignored.")
-    p.add_argument("--stationary-radius", type=float, default=120.0,
+                        "adopted as its owner (default: %(default)s). Only the owner "
+                        "attending resets the unattended timer; passers-by and bystanders "
+                        "are ignored.")
+    p.add_argument("--stationary-radius", type=float, default=d.stationary_radius,
                    help="Association radius in px: how far a bag may move between "
-                        "detections and still match the same track (default: 120). "
+                        "detections and still match the same track (default: %(default)s). "
                         "Raise it if moving a bag spawns a second box; lower it if "
                         "two nearby bags get merged.")
-    p.add_argument("--timeout", type=float, default=10.0,
+    p.add_argument("--timeout", type=float, default=d.track_timeout_sec,
                    help="Coast window: seconds a bag track survives detection dropouts "
-                        "before being dropped (default: 10). Raise it if static bags "
-                        "vanish; the unattended timer keeps running while coasting.")
-    p.add_argument("--min-confidence", type=float, default=0.5,
-                   help="Minimum detection confidence 0..1 (default: 0.5).")
-    p.add_argument("--box-smoothing", type=float, default=0.6,
+                        "before being dropped (default: %(default)s). Raise it if static "
+                        "bags vanish; the unattended timer keeps running while coasting.")
+    p.add_argument("--min-confidence", type=float, default=d.min_confidence,
+                   help="Minimum detection confidence 0..1 (default: %(default)s).")
+    p.add_argument("--box-smoothing", type=float, default=d.box_smoothing,
                    help="Weight of the newest detection when smoothing drawn boxes, "
-                        "0..1 (default: 0.6). Lower = steadier boxes on static objects; "
-                        "1.0 disables smoothing.")
-    p.add_argument("--iou", type=float, default=0.65,
-                   help="NMS IoU threshold for nanodet models (default: 0.65).")
-    p.add_argument("--max-detections", type=int, default=10,
-                   help="Max detections for nanodet models (default: 10).")
-    p.add_argument("--bag-labels", nargs="+", default=list(DEFAULT_BAG_LABELS),
-                   help="List of COCO labels to treat as bags.")
-    p.add_argument("--person-labels", nargs="+", default=list(DEFAULT_PERSON_LABELS),
-                   help="List of COCO labels to treat as people.")
+                        "0..1 (default: %(default)s). Lower = steadier boxes on static "
+                        "objects; 1.0 disables smoothing.")
+    p.add_argument("--iou", type=float, default=d.iou,
+                   help="NMS IoU threshold for nanodet models (default: %(default)s).")
+    p.add_argument("--max-detections", type=int, default=d.max_detections,
+                   help="Max detections for nanodet models (default: %(default)s).")
+    p.add_argument("--bag-labels", nargs="+", default=sorted(d.bag_labels),
+                   help="List of COCO labels to treat as bags (default: %(default)s).")
+    p.add_argument("--person-labels", nargs="+", default=sorted(d.person_labels),
+                   help="List of COCO labels to treat as people (default: %(default)s).")
     p.add_argument("--headless", action="store_true",
                    help="Run without a preview window; only save alert snapshots.")
-    p.add_argument("--snapshot-dir", type=Path, default=Path("alerts"),
-                   help="Directory for alert snapshots (default: ./alerts).")
-    p.add_argument("--alert-cooldown", type=float, default=30.0,
-                   help="Seconds between repeat alerts for the same bag (default: 30).")
+    p.add_argument("--snapshot-dir", type=Path, default=d.snapshot_dir,
+                   help="Directory for alert snapshots (default: %(default)s).")
+    p.add_argument("--max-snapshots", type=int, default=d.max_snapshots,
+                   help="Keep at most this many snapshots; oldest are deleted so long "
+                        "runs can't fill the SD card (default: %(default)s).")
+    p.add_argument("--alert-cooldown", type=float, default=d.alert_cooldown_sec,
+                   help="Seconds between repeat alerts for the same bag "
+                        "(default: %(default)s).")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
     raw = sys.argv[1:] if argv is None else list(argv)
     expanded = _resolve_preset_refs(raw)
@@ -716,6 +754,7 @@ def main(argv=None) -> None:
         headless=args.headless,
         alert_cooldown_sec=args.alert_cooldown,
         snapshot_dir=args.snapshot_dir,
+        max_snapshots=args.max_snapshots,
         model_path=args.model,
         labels_path=args.labels,
         iou=args.iou,

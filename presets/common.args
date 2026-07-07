@@ -10,6 +10,7 @@
 --unattended-time 120       # seconds before an unattended bag alerts
 --alert-cooldown 30         # seconds between repeat alerts per bag
 --snapshot-dir alerts       # where alert JPEGs are saved
+--max-snapshots 500         # keep newest N snapshots; protects the SD card
 
 # --- Tracking / association ---
 --proximity 150             # px within which the owner attends a bag

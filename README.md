@@ -154,6 +154,7 @@ python securePi.py @lobby.args --headless --unattended-time 30
 | `--person-labels` | `person` | List of COCO labels to treat as people |
 | `--headless` | off | Run without a preview window |
 | `--snapshot-dir` | `./alerts` | Where alert snapshots are written |
+| `--max-snapshots` | `500` | Keep at most this many snapshots; oldest are deleted so long runs can't fill the SD card |
 | `--alert-cooldown` | `30` | Seconds between repeat alerts per bag |
 | `-v`, `--verbose` | off | Debug logging |
 
@@ -189,6 +190,10 @@ sudo systemctl enable --now securepi.service
 journalctl -u securepi.service -f      # follow logs / alerts
 ```
 
+`systemctl stop` sends SIGTERM, which SecurePi catches to shut the camera down
+cleanly. Snapshots are capped at `--max-snapshots` (oldest deleted first), so a
+long-running service can't fill the SD card.
+
 ---
 
 ## Project layout
@@ -201,6 +206,7 @@ SecurePi/
 │   ├── lobby.args     # location preset: overrides for the lobby camera
 │   ├── kitchen.args   # location preset: overrides for the kitchen camera
 │   └── carpark.args   # location preset: overrides for the carpark camera
+├── tests/             # off-device tests (cv2 stubbed) — python tests/test_securepi.py
 ├── requirements.txt   # dependency notes
 ├── README.md          # this file
 ├── LABELS.md          # list of supported tracking objects
