@@ -12,6 +12,28 @@ snapshots, and the live view annotates each bag's state.
 
 ---
 
+## Architecture
+
+The neural network runs **on the camera sensor itself** — the Pi's CPU never
+does inference. It only reads the ready-made detections from frame metadata,
+tracks them, and decides when to alert:
+
+```mermaid
+flowchart TD
+    subgraph CAM["Raspberry Pi AI Camera (IMX500)"]
+        SENSOR["Image sensor"] --> NPU["On-sensor neural network<br/>SSD MobileNetV2, 80 COCO classes"]
+    end
+    NPU -- "detections<br/>(frame metadata)" --> DET["IMX500Detector<br/>tensors → pixel boxes"]
+    SENSOR -- "frames<br/>(copied only when needed)" --> REND
+    DET --> PT["PersonTracker<br/>stable person ids"]
+    DET --> BT["BagTracker<br/>owner-locked unattended timer"]
+    PT -- "who is the owner?" --> BT
+    BT --> GATE{"unattended ≥ threshold?"}
+    GATE -- yes --> ALERT["Alert<br/>log + annotated snapshot<br/>+ events.csv row"]
+    GATE --> REND["Renderer<br/>boxes, countdown bar, HUD"]
+    REND --> UI["Preview window<br/>(skipped in --headless)"]
+```
+
 ## How it works
 
 1. **Detect** — the IMX500 runs the neural network on-sensor; SecurePi reads the
@@ -34,18 +56,20 @@ snapshots, and the live view annotates each bag's state.
    is ignored, so they can neither reset the timer nor "claim" a bag that arrived
    with no owner. If the owner leaves, the timer runs.
 4. **Alert** — when a bag stays unattended for `--unattended-time` seconds it
-   enters the **ALERT** state: a warning is logged and a fully annotated JPEG
-   snapshot (boxes, labels, HUD) is written to the snapshot directory. Each
-   alert fires once, then repeats at most once per `--alert-cooldown` seconds
-   until a person returns.
+   enters the **ALERT** state: a warning is logged, a fully annotated JPEG
+   snapshot (boxes, labels, HUD) is written to the snapshot directory, and a
+   row is appended to `events.csv` in the same directory (time, bag id,
+   unattended duration, snapshot filename) for later analysis. Each alert
+   fires once, then repeats at most once per `--alert-cooldown` seconds until
+   a person returns.
 
 ### On-screen states
 
 | State | Box colour | Meaning |
 |-------|-----------|---------|
 | Attended | cyan | The bag's **owner** is within `--proximity` |
-| Unattended (counting) | orange | Owner away (or none); timer running, below threshold |
-| ALERT | red | Unattended ≥ `--unattended-time` seconds |
+| Unattended (counting) | orange | Owner away (or none); a countdown bar under the box fills toward the alert threshold |
+| ALERT | red | Unattended ≥ `--unattended-time` seconds (bar full) |
 | Person | green | A tracked person (labelled `(owner)` if they own a bag) |
 
 ---
@@ -78,6 +102,9 @@ one prints the available presets). Extra flags after the preset override it:
 ```bash
 # Live preview window (press 'q' to quit)
 python securePi.py @lobby.args
+
+# Presentation/demo mode — full attended → warning → ALERT cycle in ~10s
+python securePi.py @demo.args
 
 # Headless — no window; alert snapshots only (good for SSH / systemd).
 # Skips all frame annotation except when a snapshot is saved, so it's the
@@ -205,7 +232,8 @@ SecurePi/
 │   ├── common.args    # shared base (every flag, commented) — applied automatically
 │   ├── lobby.args     # location preset: overrides for the lobby camera
 │   ├── kitchen.args   # location preset: overrides for the kitchen camera
-│   └── carpark.args   # location preset: overrides for the carpark camera
+│   ├── carpark.args   # location preset: overrides for the carpark camera
+│   └── demo.args      # fast-cycle preset for live presentations (~10s to alert)
 ├── tests/             # off-device tests (cv2 stubbed) — python tests/test_securepi.py
 ├── requirements.txt   # dependency notes
 ├── README.md          # this file
@@ -213,6 +241,21 @@ SecurePi/
 ├── MODELS.md          # explanation of available .rpk networks
 └── alerts/            # alert snapshots (created on first alert)
 ```
+
+## Testing
+
+The tracking, matching, alerting, and CLI layers are covered by an off-device
+test suite — `cv2` and `picamera2` are stubbed, so it runs on any machine, no
+camera required:
+
+```bash
+python tests/test_securepi.py
+```
+
+The 10 tests cover: box smoothing, order-independent track matching (two
+nearby bags can't swap ids), stable person ids across jittery detections,
+alert threshold + cooldown timing, snapshot pruning (SD-card cap), the
+`events.csv` alert log, and preset resolution/layering/enforcement.
 
 ## Notes & limitations
 

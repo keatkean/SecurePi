@@ -24,7 +24,7 @@ sys.modules.setdefault("cv2", _cv2)
 
 from securePi import (Config, Detection, PersonTracker, BagTracker,  # noqa: E402
                       match_detections, smooth_box, parse_args, _alert_due,
-                      save_snapshot_worker)
+                      save_snapshot_worker, append_event_worker)
 
 CFG = Config()
 
@@ -95,6 +95,26 @@ def test_snapshot_pruning():
         remaining = sorted(f.name for f in directory.glob("alert_*.jpg"))
         assert len(remaining) == 3, remaining
         assert "alert_bag1_new.jpg" in remaining     # newest survives
+
+
+def test_event_log_append():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "events.csv"
+        append_event_worker(log, ["2026-07-07 10:00:00", 0, 12, "alert_bag0_x.jpg"])
+        append_event_worker(log, ["2026-07-07 10:01:00", 1, 45, "alert_bag1_y.jpg"])
+        lines = log.read_text(encoding="utf-8").strip().splitlines()
+        assert lines[0] == "time,bag_id,unattended_sec,snapshot"  # header once
+        assert len(lines) == 3
+        assert lines[2].startswith("2026-07-07 10:01:00,1,45,")
+
+
+def test_demo_preset():
+    args = parse_args(["@demo.args"])
+    assert args.unattended_time == 10.0              # demo override
+    assert args.owner_claim_time == 5.0              # demo override
+    assert args.alert_cooldown == 15.0               # demo override
+    assert args.proximity == 150.0                   # inherited from common.args
+    assert str(args.snapshot_dir).replace("\\", "/") == "alerts/demo"
 
 
 def test_presets_resolution_and_layering():

@@ -27,6 +27,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import math
 import signal
@@ -439,13 +440,31 @@ def save_snapshot_worker(frame_copy, path: Path, directory: Path, keep: int) -> 
         LOGGER.warning("Snapshot pruning failed: %s", exc)
 
 
-def save_snapshot(frame, bag: TrackedBag, config: Config) -> None:
+def save_snapshot(frame, bag: TrackedBag, config: Config) -> Path:
     config.snapshot_dir.mkdir(parents=True, exist_ok=True)
     # Wall clock for the filename only — tracking runs on the monotonic clock.
     stamp = time.strftime("%Y%m%d-%H%M%S")
     path = config.snapshot_dir / f"alert_bag{bag.bag_id}_{stamp}.jpg"
     SNAPSHOT_EXECUTOR.submit(save_snapshot_worker, frame.copy(), path,
                              config.snapshot_dir, config.max_snapshots)
+    return path
+
+
+# Every alert is appended here (inside snapshot_dir) as a CSV row, giving a
+# machine-readable record of incidents for later analysis or reporting.
+EVENT_LOG_NAME = "events.csv"
+
+
+def append_event_worker(csv_path: Path, row: list) -> None:
+    try:
+        header_needed = not csv_path.exists()
+        with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if header_needed:
+                writer.writerow(["time", "bag_id", "unattended_sec", "snapshot"])
+            writer.writerow(row)
+    except OSError as exc:
+        LOGGER.warning("Could not append to event log %s: %s", csv_path, exc)
 
 
 def _alert_due(bag: TrackedBag, config: Config, now: float) -> bool:
@@ -460,9 +479,13 @@ def _alert_due(bag: TrackedBag, config: Config, now: float) -> bool:
 def _fire_alert(frame, bag: TrackedBag, config: Config, now: float) -> None:
     bag.alerted = True
     bag.last_alert_time = now
+    duration = int(now - bag.unattended_start)
     LOGGER.warning("UNATTENDED BAG ALERT - bag #%d unattended for %ds",
-                   bag.bag_id, int(now - bag.unattended_start))
-    save_snapshot(frame, bag, config)
+                   bag.bag_id, duration)
+    snapshot_path = save_snapshot(frame, bag, config)
+    SNAPSHOT_EXECUTOR.submit(append_event_worker, config.snapshot_dir / EVENT_LOG_NAME,
+                             [time.strftime("%Y-%m-%d %H:%M:%S"), bag.bag_id,
+                              duration, snapshot_path.name])
 
 
 class Renderer:
@@ -477,6 +500,23 @@ class Renderer:
         if label:
             cv2.putText(frame, label, (x, max(y - 10, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def draw_countdown(self, frame, box: tuple[int, int, int, int],
+                       fraction: float, color) -> None:
+        """Progress bar under the box filling toward the alert threshold."""
+        x, y, w, h = box
+        bar_h = 6
+        y0 = y + h + 4
+        if y0 + bar_h >= frame.shape[0]:   # would fall off-frame: draw above instead
+            y0 = max(0, y - bar_h - 4)
+        x0 = max(0, x)
+        x1 = min(frame.shape[1] - 1, x + w)
+        if x1 <= x0:
+            return
+        cv2.rectangle(frame, (x0, y0), (x1, y0 + bar_h), color, 1)
+        fill = x0 + int((x1 - x0) * min(1.0, max(0.0, fraction)))
+        if fill > x0:
+            cv2.rectangle(frame, (x0, y0), (fill, y0 + bar_h), color, -1)
 
     def draw_hud(self, frame, person_count: int, bag_count: int, fps: float) -> None:
         cv2.rectangle(frame, (10, 10), (330, 72), (0, 0, 0), -1)
@@ -504,9 +544,15 @@ class Renderer:
         if duration >= self.config.unattended_time_sec:
             self.draw_box(frame, bag.box, COLOR_ALERT,
                      f"ALERT! Bag #{bag.bag_id} unattended {int(duration)}s", thickness=3)
+            self.draw_countdown(frame, bag.box, 1.0, COLOR_ALERT)
         else:
             self.draw_box(frame, bag.box, COLOR_WARNING,
                      f"Bag #{bag.bag_id} unattended {int(duration)}s{suffix}")
+            # Countdown bar fills toward the alert threshold so the state is
+            # readable from across the room.
+            self.draw_countdown(frame, bag.box,
+                                duration / self.config.unattended_time_sec,
+                                COLOR_WARNING)
 
 
 def _sigterm_exit(signum, frame) -> None:
