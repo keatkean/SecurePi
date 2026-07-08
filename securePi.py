@@ -476,12 +476,20 @@ def _alert_due(bag: TrackedBag, config: Config, now: float) -> bool:
     return not bag.alerted or now - bag.last_alert_time >= config.alert_cooldown_sec
 
 
-def _fire_alert(frame, bag: TrackedBag, config: Config, now: float) -> None:
+def _fire_alert(frame, bag: TrackedBag, config: Config, now: float,
+                renderer: "Renderer") -> None:
     bag.alerted = True
     bag.last_alert_time = now
     duration = int(now - bag.unattended_start)
     LOGGER.warning("UNATTENDED BAG ALERT - bag #%d unattended for %ds",
                    bag.bag_id, duration)
+    # Stamp the alert box here rather than relying on the render pass: the
+    # renderer skips tracks unseen past draw_grace_sec, so a bag the detector
+    # lost at alert time would otherwise save a snapshot with nothing marking
+    # it. Redrawing over an already-drawn box is a no-op.
+    renderer.draw_box(frame, bag.box, COLOR_ALERT,
+                      f"ALERT! Bag #{bag.bag_id} unattended {duration}s",
+                      thickness=3)
     snapshot_path = save_snapshot(frame, bag, config)
     SNAPSHOT_EXECUTOR.submit(append_event_worker, config.snapshot_dir / EVENT_LOG_NAME,
                              [time.strftime("%Y-%m-%d %H:%M:%S"), bag.bag_id,
@@ -652,7 +660,7 @@ def run(config: Config) -> None:
                 renderer.draw_hud(frame, visible_persons, len(tracker.bags), fps)
 
             for bag in alerts_due:
-                _fire_alert(frame, bag, config, now)
+                _fire_alert(frame, bag, config, now, renderer)
 
             if not config.headless:
                 cv2.imshow("SecurePi - AI Security Monitor", frame)

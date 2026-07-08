@@ -16,15 +16,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Stub cv2 so the module imports without OpenCV. imwrite writes a placeholder
-# file so the snapshot-pruning test can observe real files on disk.
+# file so the snapshot-pruning test can observe real files on disk; the drawing
+# stubs record their calls so annotation tests can assert what was drawn.
+_draw_calls = []
 _cv2 = types.SimpleNamespace(
     imwrite=lambda path, img: Path(path).write_bytes(b"jpg") > 0,
+    rectangle=lambda frame, p1, p2, color, thickness: _draw_calls.append(
+        ("rect", p1, p2, color, thickness)),
+    putText=lambda frame, text, org, font, scale, color, thickness: _draw_calls.append(
+        ("text", text, color)),
+    FONT_HERSHEY_SIMPLEX=0,
 )
 sys.modules.setdefault("cv2", _cv2)
 
 from securePi import (Config, Detection, PersonTracker, BagTracker,  # noqa: E402
                       match_detections, smooth_box, parse_args, _alert_due,
-                      save_snapshot_worker, append_event_worker)
+                      save_snapshot_worker, append_event_worker,
+                      Renderer, _fire_alert, SNAPSHOT_EXECUTOR, COLOR_ALERT)
+
+
+class FakeFrame:
+    """Minimal frame stand-in: drawing stubs ignore it, save_snapshot copies it."""
+
+    def copy(self):
+        return self
 
 CFG = Config()
 
@@ -148,6 +163,35 @@ def test_preset_required():
     except SystemExit as e:
         assert e.code == 0
     assert "--unattended-time" in out.getvalue()
+
+
+def test_alert_snapshot_has_bag_box():
+    """The saved alert snapshot must mark the offending bag, even if the
+    renderer skipped its box (track coasting past draw_grace_sec)."""
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Config(snapshot_dir=Path(td))
+        bt = BagTracker(cfg)
+        bt.update([Detection("suitcase", 0.9, (50, 60, 40, 40))], [], now=0.0)
+        bag = bt.bags[0]
+        bag.unattended_start = 0.0
+
+        _draw_calls.clear()
+        import securePi
+        securePi.LOGGER.disabled = True
+        try:
+            _fire_alert(FakeFrame(), bag, cfg, now=cfg.unattended_time_sec + 5,
+                        renderer=Renderer(cfg))
+        finally:
+            securePi.LOGGER.disabled = False
+        # Drain the single-worker executor so the snapshot write has finished.
+        SNAPSHOT_EXECUTOR.submit(lambda: None).result()
+
+        rects = [c for c in _draw_calls if c[0] == "rect"]
+        assert any(c[3] == COLOR_ALERT and c[4] == 3 for c in rects), \
+            "no thick red alert box was drawn on the frame"
+        texts = [c for c in _draw_calls if c[0] == "text"]
+        assert any("ALERT" in c[1] and f"Bag #{bag.bag_id}" in c[1] for c in texts)
+        assert len(list(Path(td).glob("alert_*.jpg"))) == 1
 
 
 if __name__ == "__main__":
