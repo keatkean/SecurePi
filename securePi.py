@@ -185,6 +185,26 @@ def smooth_box(old: tuple[int, int, int, int], new: tuple[int, int, int, int],
     return (x, y, w, h)
 
 
+# Detections/tracks overlapping this much are the same physical object.
+DEDUP_IOU = 0.45
+
+
+def dedup_detections(detections: list[Detection]) -> list[Detection]:
+    """Cross-label NMS: collapse detections of the same physical object.
+
+    The sensor's SSD post-processing suppresses duplicates per class only, so
+    one bag can come back as both "backpack" and "handbag" at nearly the same
+    box in the same frame — which would spawn one track (and one alert box)
+    per label. All bag labels mean the same thing here, so keep only the
+    highest-confidence detection of any overlapping cluster.
+    """
+    keep: list[Detection] = []
+    for det in sorted(detections, key=lambda d: d.score, reverse=True):
+        if all(calculate_iou(det.box, k.box) < DEDUP_IOU for k in keep):
+            keep.append(det)
+    return keep
+
+
 def match_detections(detections: list[Detection], tracks: list,
                      iou_gate: float, dist_gate: float) -> dict[int, Any]:
     """Best-first global matching of this frame's detections to tracks.
@@ -326,6 +346,7 @@ class PersonTracker:
         self._next_id = 0
 
     def update(self, detections: list[Detection], now: float) -> None:
+        detections = dedup_detections(detections)
         matches = match_detections(detections, list(self.tracks.values()),
                                    iou_gate=0.2,
                                    dist_gate=self.config.person_match_radius)
@@ -358,6 +379,7 @@ class BagTracker:
     def update(self, bag_detections: list[Detection],
                persons: list[PersonTrack], now: float) -> None:
         """Match this frame's bag detections to tracks and refresh attention state."""
+        bag_detections = dedup_detections(bag_detections)
         matches = match_detections(bag_detections, list(self.bags.values()),
                                    iou_gate=0.3,
                                    dist_gate=self.config.stationary_radius)
@@ -370,6 +392,38 @@ class BagTracker:
                 bag.centroid = box_centroid(bag.box)
                 bag.last_seen = now
             self._update_attention(bag, persons, now)
+        self._merge_duplicate_tracks()
+
+    def _merge_duplicate_tracks(self) -> None:
+        """Collapse tracks stacked on the same physical bag.
+
+        Detection flicker can strand a coasting track that a fresh track then
+        piles onto — both would alert (and both would stamp a red box on the
+        snapshot). The oldest track wins: it keeps its id, owner, and
+        unattended timer, and adopts the duplicate's fresher sighting.
+        """
+        ids = sorted(self.bags)  # ascending id = oldest first
+        dropped: set[int] = set()
+        for i, keep_id in enumerate(ids):
+            if keep_id in dropped:
+                continue
+            keeper = self.bags[keep_id]
+            for dup_id in ids[i + 1:]:
+                if dup_id in dropped:
+                    continue
+                dup = self.bags[dup_id]
+                if calculate_iou(keeper.box, dup.box) < DEDUP_IOU:
+                    continue
+                if dup.last_seen > keeper.last_seen:
+                    keeper.box = dup.box
+                    keeper.centroid = dup.centroid
+                    keeper.last_seen = dup.last_seen
+                if keeper.owner_id is None:
+                    keeper.owner_id = dup.owner_id
+                dropped.add(dup_id)
+                LOGGER.debug("Merged duplicate bag #%d into bag #%d", dup_id, keep_id)
+        for bid in dropped:
+            del self.bags[bid]
 
     def prune(self, now: float) -> list[int]:
         """Drop tracks not seen within the timeout. Returns removed ids."""

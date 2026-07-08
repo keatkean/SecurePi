@@ -32,7 +32,8 @@ sys.modules.setdefault("cv2", _cv2)
 from securePi import (Config, Detection, PersonTracker, BagTracker,  # noqa: E402
                       match_detections, smooth_box, parse_args, _alert_due,
                       save_snapshot_worker, append_event_worker,
-                      Renderer, _fire_alert, SNAPSHOT_EXECUTOR, COLOR_ALERT)
+                      Renderer, _fire_alert, SNAPSHOT_EXECUTOR, COLOR_ALERT,
+                      dedup_detections)
 
 
 class FakeFrame:
@@ -163,6 +164,37 @@ def test_preset_required():
     except SystemExit as e:
         assert e.code == 0
     assert "--unattended-time" in out.getvalue()
+
+
+def test_dedup_cross_label_detections():
+    """One bag reported as backpack AND handbag in the same frame -> one detection."""
+    dets = [Detection("backpack", 0.7, (100, 100, 40, 40)),
+            Detection("handbag", 0.9, (102, 101, 40, 42)),
+            Detection("suitcase", 0.8, (300, 100, 40, 40))]   # a genuinely separate bag
+    kept = dedup_detections(dets)
+    assert len(kept) == 2
+    assert kept[0].label == "handbag"                          # highest score wins
+    assert any(d.label == "suitcase" for d in kept)
+
+
+def test_duplicate_bag_detections_one_track():
+    bt = BagTracker(CFG)
+    bt.update([Detection("backpack", 0.7, (100, 100, 40, 40)),
+               Detection("handbag", 0.9, (102, 101, 40, 42))], [], now=0.0)
+    assert len(bt.bags) == 1
+
+
+def test_duplicate_bag_tracks_merge():
+    """A stale flicker track stacked on the same bag collapses into the oldest,
+    which keeps its id and unattended timer."""
+    bt = BagTracker(CFG)
+    bt.update([Detection("suitcase", 0.9, (100, 100, 40, 40))], [], now=0.0)
+    bt._register(Detection("suitcase", 0.9, (104, 102, 40, 40)), now=5.0)
+    assert len(bt.bags) == 2
+    bt.update([], [], now=6.0)
+    assert list(bt.bags) == [0]                                # oldest id survives
+    assert bt.bags[0].unattended_start == 0.0                  # timer not reset
+    assert bt.bags[0].last_seen == 5.0                         # fresher sighting adopted
 
 
 def test_alert_snapshot_has_bag_box():
