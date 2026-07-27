@@ -24,6 +24,22 @@ flowchart TD
 
 ---
 
+## 📊 Dataset Sources & Download Reference Table
+
+Where to find annotated images and bounding box labels for each target class:
+
+| Target Class | Source Dataset | Dataset URL / Access Link | License | Recommended Sample Count | Description & Download Method |
+| :--- | :--- | :--- | :--- | :---: | :--- |
+| **`person`** | COCO 2017 | [COCO Dataset](https://cocodataset.org/#explore) | CC BY 4.0 | ~2,000 images | Standard COCO `person` subset. Downloadable via FiftyOne or Roboflow. |
+| **`backpack`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `backpack` subset. |
+| **`handbag`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `handbag` subset. |
+| **`suitcase`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `suitcase` subset. |
+| **`rat`** | Roboflow Universe | [Roboflow Rat Datasets](https://universe.roboflow.com/search?q=rat) | Public / CC BY | ~1,000 images | Annotated rat images (indoor, outdoor, dark/IR footage). |
+| **`mouse`** | Roboflow Universe | [Roboflow Mouse Datasets](https://universe.roboflow.com/search?q=mouse) | Public / CC BY | ~1,000 images | Annotated live mouse images (pest control datasets). |
+| **`rat` & `mouse`** | Open Images V7 | [Google Open Images V7](https://storage.googleapis.com/openimages/web/index.html) | CC BY 2.0 | ~1,500 images | Classes `/m/06mf6` (Rat) and `/m/04rky` (Mouse). Downloadable via `fiftyone`. |
+
+---
+
 ## 📓 Complete Google Colab Notebook Script
 
 Open [Google Colab](https://colab.research.google.com/), create a new Notebook, set **Runtime Type** to **Python 3 with T4 GPU**, and copy each cell below:
@@ -33,17 +49,21 @@ Open [Google Colab](https://colab.research.google.com/), create a new Notebook, 
 # Check GPU availability
 !nvidia-smi
 
-# Install required tools: Ultralytics YOLO, ONNX, and Sony IMX500 Converter
-!pip install -q ultralytics onnx onnxruntime imx500-converter roboflow
+# Install required tools: Ultralytics YOLO, ONNX, FiftyOne, and Sony IMX500 Converter
+!pip install -q ultralytics onnx onnxruntime imx500-converter roboflow fiftyone
 print("✅ Environment setup complete.")
 ```
 
 ---
 
-### 📍 Cell 2: Download Dataset & Configure `dataset.yaml`
+### 📍 Cell 2: Automated Dataset Sourcing & Setup
+Execute this cell to download datasets via FiftyOne / Roboflow directly into Colab:
+
 ```python
 import os
 from pathlib import Path
+import fiftyone as fo
+import fiftyone.zoo as foz
 
 # Create directory structure
 dataset_dir = Path("./dataset")
@@ -71,14 +91,34 @@ with open(dataset_dir / "dataset.yaml", "w") as f:
     f.write(dataset_yaml.strip())
 
 print("✅ dataset.yaml generated.")
+
+# Option A: Download COCO subset using FiftyOne
+print("📥 Downloading COCO subset (person, backpack, handbag, suitcase)...")
+coco_dataset = foz.load_zoo_dataset(
+    "coco-2017",
+    split="validation",
+    label_types=["detections"],
+    classes=["person", "backpack", "handbag", "suitcase"],
+    max_samples=1000,
+    dataset_name="coco_subset"
+)
+
+# Export COCO subset in YOLO format
+coco_dataset.export(
+    export_dir=str(dataset_dir),
+    dataset_type=fo.types.YOLOv5Dataset,
+    label_field="ground_truth",
+    split="val"
+)
+print("✅ COCO subset downloaded and exported to dataset/.")
 ```
 
-> **Optional Roboflow Auto-Download:**
-> If using a Roboflow dataset for rodents, insert your Roboflow API key:
+> **Option B: Download Rodent Datasets via Roboflow API**
 > ```python
 > from roboflow import Roboflow
 > rf = Roboflow(api_key="YOUR_ROBOFLOW_API_KEY")
-> project = rf.workspace("workspace-id").project("pest-detection")
+> # Download public rat/mouse dataset from Roboflow Universe
+> project = rf.workspace("rodent-detection").project("rat-and-mouse")
 > dataset = project.version(1).download("yolov8")
 > ```
 
