@@ -1,78 +1,116 @@
-# Implementation Plan: Google Colab Workflow for Custom IMX500 Multi-Class Model
+# Simple Setup Guide: Custom AI Model for SecurePi
 
-This plan provides a step-by-step **Google Colab Notebook** workflow to train, convert, and compile the custom multi-class AI model (`person`, `backpack`, `handbag`, `suitcase`, `rat`, `mouse`) on Google Colab's cloud GPU, and then deploy the resulting `.rpk` file to SecurePi on your Raspberry Pi.
+This guide explains how to build and deploy a **custom multi-class model** (`person`, `backpack`, `handbag`, `suitcase`, `rat`, `mouse`) for SecurePi using **Google Colab (Free GPU)** and your **Raspberry Pi**.
 
 ---
 
-## 🎯 Architecture & Responsibility Division
+## 💡 FAQ: Does Downloading a Dataset Include BOTH Images and Labels?
 
-```mermaid
-flowchart TD
-    subgraph Colab["Google Colab Cloud GPU"]
-        A["1. Install Dependencies & Mount Drive"] --> B["2. Download & Merge Dataset"]
-        B --> C["3. Train Model on Colab T4 GPU"]
-        C --> D["4. Export to ONNX"]
-        D --> E["5. Quantize & Compile to .rpk via Sony Toolchain"]
-        E --> F["6. Download .rpk File"]
-    end
+> [!IMPORTANT]
+> **YES!** The automated script in **Colab Cell 2** downloads the photos AND automatically generates the matching `.txt` bounding box label files for all 6 target classes.
+> 
+> You **do NOT need to draw boxes or write text files manually**!
 
-    subgraph Pi["Raspberry Pi - SecurePi Project"]
-        F --> G["7. Copy .rpk to Raspberry Pi"]
-        G --> H["8. Run securePi.py with custom .rpk"]
-    end
+---
+
+## ❓ What Needs to be Put in the `train/` Folders?
+
+There are **two separate `train` subfolders** inside your dataset:
+
+### 1. Inside `dataset/images/train/`
+Contains **80% of photo files** (`.jpg`, `.jpeg`, or `.png`):
+- `person01.jpg`
+- `bag01.jpg`
+- `rat01.jpg`
+- `mouse01.jpg`
+
+### 2. Inside `dataset/labels/train/`
+Contains the **matching text annotation files** (`.txt`):
+- `person01.txt`
+- `bag01.txt`
+- `rat01.txt`
+- `mouse01.txt`
+
+---
+
+## 📂 Complete Dataset Folder Structure
+
+```text
+dataset/
+├── dataset.yaml              <-- Main Configuration File
+├── images/
+│   ├── train/                <-- Put 80% of photos here (.jpg / .png)
+│   │   ├── rat01.jpg
+│   │   ├── person01.jpg
+│   │   └── ...
+│   └── val/                  <-- Put remaining 20% of photos here
+│       ├── rat101.jpg
+│       └── ...
+└── labels/
+    ├── train/                <-- Put matching text answer files here (.txt)
+    │   ├── rat01.txt
+    │   ├── person01.txt
+    │   └── ...
+    └── val/                  <-- Put matching text answer files here (.txt)
+        ├── rat101.txt
+        └── ...
 ```
 
 ---
 
-## 📊 Dataset Sources & Download Reference Table
+## 🚀 Step-by-Step Setup Instructions
 
-Where to find annotated images and bounding box labels for each target class:
-
-| Target Class | Source Dataset | Dataset URL / Access Link | License | Recommended Sample Count | Description & Download Method |
-| :--- | :--- | :--- | :--- | :---: | :--- |
-| **`person`** | COCO 2017 | [COCO Dataset](https://cocodataset.org/#explore) | CC BY 4.0 | ~2,000 images | Standard COCO `person` subset. Downloadable via FiftyOne or Roboflow. |
-| **`backpack`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `backpack` subset. |
-| **`handbag`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `handbag` subset. |
-| **`suitcase`** | COCO 2017 | [Roboflow COCO-128](https://universe.roboflow.com/roboflow-100/coco-128) | CC BY 4.0 | ~500 images | Standard COCO `suitcase` subset. |
-| **`rat`** | Roboflow Universe | [Roboflow Rat Datasets](https://universe.roboflow.com/search?q=rat) | Public / CC BY | ~1,000 images | Annotated rat images (indoor, outdoor, dark/IR footage). |
-| **`mouse`** | Roboflow Universe | [Roboflow Mouse Datasets](https://universe.roboflow.com/search?q=mouse) | Public / CC BY | ~1,000 images | Annotated live mouse images (pest control datasets). |
-| **`rat` & `mouse`** | Open Images V7 | [Google Open Images V7](https://storage.googleapis.com/openimages/web/index.html) | CC BY 2.0 | ~1,500 images | Classes `/m/06mf6` (Rat) and `/m/04rky` (Mouse). Downloadable via `fiftyone`. |
+### Step 1: Open Google Colab
+1. Go to `https://colab.research.google.com` in your web browser.
+2. Click **New Notebook**.
+3. In the top menu, click **Runtime** ➡️ **Change runtime type** ➡️ Select **T4 GPU** ➡️ Click **Save**.
 
 ---
 
-## 📓 Complete Google Colab Notebook Script
+### Step 2: Run Colab Code Cells (Copy & Paste)
 
-Open [Google Colab](https://colab.research.google.com/), create a new Notebook, set **Runtime Type** to **Python 3 with T4 GPU**, and copy each cell below:
+Create 6 code cells in your Colab notebook and run them sequentially:
 
-### 📍 Cell 1: Environment Setup & GPU Check
+#### 📍 Cell 1: Install Tools
 ```python
-# Check GPU availability
+# Check GPU and install tools
 !nvidia-smi
-
-# Install required tools: Ultralytics YOLO, ONNX, FiftyOne, and Sony IMX500 Converter
-!pip install -q ultralytics onnx onnxruntime imx500-converter roboflow fiftyone
-print("✅ Environment setup complete.")
+!pip install -q ultralytics onnx onnxruntime imx500-converter fiftyone
+print("✅ Environment Ready!")
 ```
 
----
-
-### 📍 Cell 2: Automated Dataset Sourcing & Setup
-Execute this cell to download datasets via FiftyOne / Roboflow directly into Colab:
+#### 📍 Cell 2: Automated 100% Bulletproof Dataset Download & Class Mapping
+This cell downloads COCO (people & bags) and Open Images (rats & mice), maps their class IDs cleanly `0..5`, and splits them 80% train / 20% validation:
 
 ```python
 import os
+import shutil
 from pathlib import Path
 import fiftyone as fo
 import fiftyone.zoo as foz
 
-# Create directory structure
+# Setup clean directories
 dataset_dir = Path("./dataset")
+if dataset_dir.exists():
+    shutil.rmtree(dataset_dir)
+
 (dataset_dir / "images" / "train").mkdir(parents=True, exist_ok=True)
 (dataset_dir / "images" / "val").mkdir(parents=True, exist_ok=True)
 (dataset_dir / "labels" / "train").mkdir(parents=True, exist_ok=True)
 (dataset_dir / "labels" / "val").mkdir(parents=True, exist_ok=True)
 
-# Generate dataset configuration file
+# Define unified class mapping
+CLASS_MAP = {
+    "person": 0,
+    "backpack": 1,
+    "handbag": 2,
+    "suitcase": 3,
+    "Rat": 4,
+    "rat": 4,
+    "Mouse": 5,
+    "mouse": 5
+}
+
 dataset_yaml = """
 path: ./dataset
 train: images/train
@@ -90,74 +128,104 @@ names:
 with open(dataset_dir / "dataset.yaml", "w") as f:
     f.write(dataset_yaml.strip())
 
-print("✅ dataset.yaml generated.")
-
-# Option A: Download COCO subset using FiftyOne
-print("📥 Downloading COCO subset (person, backpack, handbag, suitcase)...")
-coco_dataset = foz.load_zoo_dataset(
+# Download COCO subset using FiftyOne
+print("📥 [1/2] Downloading COCO dataset (people & bags)...")
+coco_ds = foz.load_zoo_dataset(
     "coco-2017",
     split="validation",
     label_types=["detections"],
     classes=["person", "backpack", "handbag", "suitcase"],
-    max_samples=1000,
+    max_samples=600,
     dataset_name="coco_subset"
 )
 
-# Export COCO subset in YOLO format
-coco_dataset.export(
-    export_dir=str(dataset_dir),
-    dataset_type=fo.types.YOLOv5Dataset,
-    label_field="ground_truth",
-    split="val"
+# Download Open Images v7 subset for Rodents
+print("📥 [2/2] Downloading Open Images dataset (rats & mice)...")
+rodent_ds = foz.load_zoo_dataset(
+    "open-images-v7",
+    split="validation",
+    label_types=["detections"],
+    classes=["Rat", "Mouse"],
+    max_samples=400,
+    dataset_name="rodent_subset"
 )
-print("✅ COCO subset downloaded and exported to dataset/.")
+
+# Export function to format images & labels cleanly in YOLO format
+def export_samples_to_yolo(samples, split_name):
+    img_out = dataset_dir / "images" / split_name
+    lbl_out = dataset_dir / "labels" / split_name
+    
+    for sample in samples:
+        src_img_path = sample.filepath
+        filename = Path(src_img_path).name
+        stem = Path(src_img_path).stem
+        
+        # Copy image file
+        dest_img_path = img_out / filename
+        shutil.copy(src_img_path, dest_img_path)
+        
+        # Create YOLO label file
+        txt_path = lbl_out / f"{stem}.txt"
+        
+        yolo_lines = []
+        if sample.ground_truth is not None:
+            for det in sample.ground_truth.detections:
+                label_str = det.label
+                if label_str in CLASS_MAP:
+                    cls_id = CLASS_MAP[label_str]
+                    # FiftyOne detections bounding_box: [x_min, y_min, width, height] (normalized 0..1)
+                    x_min, y_min, box_w, box_h = det.bounding_box
+                    x_center = x_min + (box_w / 2.0)
+                    y_center = y_min + (box_h / 2.0)
+                    yolo_lines.append(f"{cls_id} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}")
+        
+        with open(txt_path, "w") as f:
+            f.write("\n".join(yolo_lines))
+
+print("⚡ Formatting & pairing images into YOLO format...")
+coco_samples = list(coco_ds)
+rodent_samples = list(rodent_ds)
+
+coco_split = int(len(coco_samples) * 0.8)
+rodent_split = int(len(rodent_samples) * 0.8)
+
+# 80% train, 20% val
+export_samples_to_yolo(coco_samples[:coco_split], "train")
+export_samples_to_yolo(coco_samples[coco_split:], "val")
+export_samples_to_yolo(rodent_samples[:rodent_split], "train")
+export_samples_to_yolo(rodent_samples[rodent_split:], "val")
+
+print("✅ Dataset successfully downloaded, mapped, and ready for training!")
 ```
 
-> **Option B: Download Rodent Datasets via Roboflow API**
-> ```python
-> from roboflow import Roboflow
-> rf = Roboflow(api_key="YOUR_ROBOFLOW_API_KEY")
-> # Download public rat/mouse dataset from Roboflow Universe
-> project = rf.workspace("rodent-detection").project("rat-and-mouse")
-> dataset = project.version(1).download("yolov8")
-> ```
-
----
-
-### 📍 Cell 3: Fine-Tune Model on Colab GPU
+#### 📍 Cell 3: Train AI Model on GPU (~15 Minutes)
 ```python
 from ultralytics import YOLO
 
-# Load lightweight YOLOv8 nano model
+# Load lightweight AI model template
 model = YOLO("yolov8n.pt")
 
-# Train model for 50 epochs (takes ~15-20 minutes on Colab GPU)
-results = model.train(
+# Train model on all 6 target classes
+model.train(
     data="./dataset/dataset.yaml",
     epochs=50,
-    imgsz=320,              # 320x320 resolution matching IMX500 input
+    imgsz=320,
     batch=16,
-    workers=4,
     device=0,
-    name="securepi_imx500_colab",
-    optimizer="AdamW",
-    lr0=0.001,
-    augment=True            # Brightness/contrast augmentation for IR camera views
+    name="securepi_model"
 )
 
-print("✅ Model training finished!")
+print("🎉 Model training finished!")
 ```
 
----
-
-### 📍 Cell 4: Export to ONNX Format
+#### 📍 Cell 4: Export to ONNX Format
 ```python
 from ultralytics import YOLO
 
-# Load fine-tuned best weights
-trained_model = YOLO("runs/detect/securepi_imx500_colab/weights/best.pt")
+# Load fine-tuned model
+trained_model = YOLO("runs/detect/securepi_model/weights/best.pt")
 
-# Export to ONNX (opset 11 for IMX500 converter compatibility)
+# Export to ONNX format
 onnx_file = trained_model.export(
     format="onnx",
     imgsz=320,
@@ -165,48 +233,44 @@ onnx_file = trained_model.export(
     opset=11
 )
 
-print(f"✅ ONNX model exported to: {onnx_file}")
+print(f"✅ ONNX model saved to: {onnx_file}")
 ```
 
----
-
-### 📍 Cell 5: Sony IMX500 Quantization & `.rpk` Compilation
+#### 📍 Cell 5: Compile to IMX500 Camera Format (`.rpk`)
 ```python
-# Convert ONNX to INT8 quantized .rpk firmware using Sony IMX500 Converter
+# Convert ONNX model to Sony IMX500 camera format (.rpk)
 !imx500-converter convert \
-    --input runs/detect/securepi_imx500_colab/weights/best.onnx \
+    --input runs/detect/securepi_model/weights/best.onnx \
     --output imx500_custom_securepi.rpk \
     --input-shape 1 3 320 320 \
     --quantization-dataset ./dataset/images/val \
     --target-device imx500
 
-print("🎉 Success! imx500_custom_securepi.rpk generated.")
+print("🎉 imx500_custom_securepi.rpk successfully created!")
 ```
 
----
-
-### 📍 Cell 6: Download `.rpk` File to Your Computer
+#### 📍 Cell 6: Download `.rpk` File to Your Computer
 ```python
 from google.colab import files
 
-# Trigger browser download of the compiled .rpk file
+# Download the final model file to your PC downloads folder
 files.download("imx500_custom_securepi.rpk")
 ```
 
 ---
 
-## 🍓 Local Raspberry Pi Deployment Steps
+### Step 3: Copy Model to Raspberry Pi
+1. Locate `imx500_custom_securepi.rpk` in your computer's **Downloads** folder.
+2. Copy it to your Raspberry Pi folder `/home/pi/models/` (using WinSCP, FileZilla, or terminal command):
+   ```bash
+   scp ~/Downloads/imx500_custom_securepi.rpk pi@raspberrypi.local:/home/pi/models/
+   ```
 
-Once you have downloaded `imx500_custom_securepi.rpk` from Colab to your PC:
+---
 
-### 1. Transfer `.rpk` file to Raspberry Pi
-Using SCP / WinSCP / SFTP:
-```bash
-scp imx500_custom_securepi.rpk pi@raspberrypi.local:/home/pi/models/
-```
+### Step 4: Run SecurePi on Raspberry Pi
+Open your terminal on the Raspberry Pi inside the `SecurePi` directory and run:
 
-### 2. Run SecurePi with Custom Model
-In your local `SecurePi` workspace on the Raspberry Pi:
 ```bash
 python securePi.py \
     --model /home/pi/models/imx500_custom_securepi.rpk \
@@ -214,11 +278,3 @@ python securePi.py \
     --bag-labels backpack handbag suitcase rat mouse \
     --unattended-time 10
 ```
-
----
-
-## 🧪 Verification Plan
-
-1. **Colab Execution Check:** Verify Cell 5 outputs `imx500_custom_securepi.rpk` with no conversion errors.
-2. **Local Deployment Check:** Verify `securePi.py` starts without tensor shape mismatch crashes.
-3. **Detection Check:** Verify both people/bags and rodent objects trigger bounding boxes with correct class names (`person`, `backpack`, `rat`, `mouse`).
